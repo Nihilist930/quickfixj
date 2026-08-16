@@ -58,7 +58,8 @@ public class Banzai {
     public Banzai(String[] args) throws Exception {
         InputStream inputStream = null;
         if (args.length == 0) {
-            inputStream = Banzai.class.getResourceAsStream("banzai.cfg");
+//            inputStream = Banzai.class.getResourceAsStream("banzai.cfg");
+            inputStream = Banzai.class.getResourceAsStream("banzai_ordermatch.cfg");
         } else if (args.length == 1) {
             inputStream = new FileInputStream(args[0]);
         }
