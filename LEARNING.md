@@ -1,8 +1,8 @@
 # QuickFIX/J 学习路线与进度
 
 > 学习分支：`learning/ordermatch`  
-> 最后更新：2026-08-16  
-> 当前阶段：阶段一（跑通示例并沿消息链路阅读）
+> 最后更新：2026-08-17  
+> 当前阶段：阶段二（理解消息模型与字典，已开始）
 
 本文件是本地学习的恢复入口。每次继续前，先读 **当前进度** 与 **下一步**。
 
@@ -12,6 +12,8 @@
 
 已完成：
 
+### 阶段一：跑通示例并沿消息链路阅读
+
 - [x] 理解项目的三层运行时结构：`quickfixj-base`、`quickfixj-core`、`quickfixj-messages`。
 - [x] 使用 Maven 3.9.16 成功构建 `ordermatch` 及其依赖链。
 - [x] 运行 `OrderMatch`，作为 FIX 4.2 的 Acceptor，监听 `localhost:9876`。
@@ -19,6 +21,24 @@
 - [x] Banzai 与 OrderMatch 成功完成 FIX Logon。
 - [x] 在 Banzai 提交订单，OrderMatch 成功收到订单。
 - [x] 建立本地学习分支：`learning/ordermatch`。
+- [x] 沿第一笔订单打通主链路：`Banzai -> NewOrderSingle -> OrderMatch -> ExecutionReport`。
+- [x] 理解 `fromApp(Message, SessionID)` 为什么先接收到通用 `Message`。
+- [x] 理解 `crack(message, sessionId)` 如何基于运行时类型分派到 `onMessage(NewOrderSingle, SessionID)`。
+- [x] 理解 `8=FIX.4.2` 与 `35=D` 在解析阶段分别表示协议版本与消息类型。
+- [x] 理解 Header 中 `49=BANZAI`、`56=EXEC` 的会话身份含义。
+- [x] 确认 `ExecutionReport` 在 `ordermatch` 示例中的创建位置与发送 API。
+- [x] 梳理从服务启动、Logon、下单、回报到 Logoff/停止的完整主流程。
+
+### 阶段二：理解消息模型与字典（进行中）
+
+- [x] 确认当前学习环境固定在 FIX 4.2：`Banzai` 默认加载 `banzai_ordermatch.cfg`，其 `BeginString=FIX.4.2`、`DataDictionary=FIX42.xml`。
+- [x] 对照 `quickfixj-messages-fix42/pom.xml` 与 `quickfixj-messages-fix44/pom.xml`，理解各协议版本消息模块会分别打包自己的字典 XML 与强类型消息类。
+- [x] 建立“协议版本 -> 字典文件 -> Java 强类型消息包”的对应关系：例如 FIX 4.2 对应 `FIX42.xml` 与 `quickfix.fix42.*`。
+- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/FieldMap.java`，理解字段容器、Header/Body/Trailer 的公共存储结构。
+- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/Message.java`，理解消息对象的整体结构与 parse/set/get 的入口。
+- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/DataDictionary.java`，理解字段校验、必填校验、枚举值校验的规则来源。
+- [ ] 结合 `quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java`，继续理解原始字符串如何被解析成强类型消息对象。
+- [ ] 结合 `quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java`，理解 `BeginString + MsgType` 如何决定具体消息类。
 
 当前本地配对：
 
@@ -120,10 +140,15 @@ sessionID：当前本地会话标识
 ### 4. 回答以下问题后再进入下一阶段
 
 - `fromApp(Message, SessionID)` 为什么拿到的是通用 `Message`？
+  - 因为 `Application` 接口把应用层消息的统一入口就定义成了 `fromApp(Message, SessionID)`，引擎在 `Session.fromCallback(...)` 中只区分这是 Admin 还是 App 消息，然后把它作为通用 `Message` 交给应用层。此时这样设计是为了先提供一个统一入口；真正的强类型分派是在后面的 `MessageCracker` 中完成。可对照：`quickfixj-core/src/main/java/quickfix/Application.java:124`、`quickfixj-core/src/main/java/quickfix/Session.java:1935`。
 - `crack(message, sessionId)` 如何决定调用 `onMessage(NewOrderSingle, ...)`？
+  - `MessageCracker` 在初始化时会反射扫描当前对象上所有符合签名的 `onMessage(某消息类型, SessionID)` 方法，并按“消息 Java 类 -> 调用器”建立映射。`crack(...)` 执行时直接用 `message.getClass()` 去这个映射里查找；如果传入对象的运行时类型正好是 `quickfix.fix42.NewOrderSingle`，就会命中并调用 `onMessage(NewOrderSingle, SessionID)`。可对照：`quickfixj-core/src/main/java/quickfix/MessageCracker.java:71`、`quickfixj-core/src/main/java/quickfix/MessageCracker.java:122`。
 - `8=FIX.4.2` 与 `35=D` 分别表达什么？
+  - `8=FIX.4.2` 是 BeginString，表示这条报文使用 FIX 4.2 协议版本；`35=D` 是 MsgType，表示这是一条 `NewOrderSingle` 新订单消息。引擎解析原始字符串时，会先从报文里取出 BeginString 和 MsgType，再调用消息工厂创建对应版本、对应类型的强类型消息对象。可对照：`quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java:37`、`quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java:71`、`quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java:157`。
 - 消息 Header 的 `49=BANZAI`、`56=EXEC` 分别代表什么？
+  - `49` 是 `SenderCompID`，表示发送方逻辑身份，所以 `49=BANZAI` 表示这条消息是 BANZAI 发出的；`56` 是 `TargetCompID`，表示接收方逻辑身份，所以 `56=EXEC` 表示目标是 EXEC。对 OrderMatch 收到的订单来说，就是“BANZAI 发给 EXEC”。这些值也会参与组成 `SessionID`。可对照：`quickfixj-base/src/main/java/quickfix/Message.java:568`、`quickfixj-examples/ordermatch/src/main/java/quickfix/examples/ordermatch/Application.java:85`。
 - `ExecutionReport` 是在哪个方法创建、通过哪个 API 发送的？
+  - 在 OrderMatch 示例里，正常订单状态回报是在 `updateOrder(Order order, char status)` 中创建 `ExecutionReport` 的；拒单场景则在 `rejectOrder(String senderCompId, String targetCompId, ...)` 中创建。创建完成后，都是通过 `Session.sendToTarget(...)` 发回对应会话。可对照：`quickfixj-examples/ordermatch/src/main/java/quickfix/examples/ordermatch/Application.java:117`、`quickfixj-examples/ordermatch/src/main/java/quickfix/examples/ordermatch/Application.java:164`、`quickfixj-core/src/main/java/quickfix/Session.java:723`、`quickfixj-core/src/main/java/quickfix/Session.java:762`。
 
 完成这些问题后，继续阅读：
 
@@ -131,6 +156,196 @@ sessionID：当前本地会话标识
 quickfixj-core/src/main/java/quickfix/MessageCracker.java
 quickfixj-base/src/main/java/quickfix/Message.java
 quickfixj-base/src/main/java/quickfix/FieldMap.java
+```
+
+### 5. 从服务启动到结束的完整流程示意图
+
+下面这张图把本地学习环境里最重要的一条主线串起来：
+
+- Banzai：Initiator，负责主动连上 OrderMatch，并发送订单
+- OrderMatch：Acceptor，负责监听端口、接收订单、返回回报
+- QuickFIX/J Core：负责会话、解析、校验、分派、发送
+
+```text
+一、服务启动阶段
+
+OrderMatch Main.main
+  -> 读取 ordermatch.cfg
+  -> new SessionSettings(inputStream)
+  -> new Application()
+  -> new FileStoreFactory(settings)
+  -> new ScreenLogFactory(settings)
+  -> new DefaultMessageFactory()
+  -> new SocketAcceptor(...)
+  -> acceptor.start()
+  -> 创建 Session / 启动监听端口 9876
+
+Banzai Banzai.main
+  -> 读取 banzai_ordermatch.cfg
+  -> new SessionSettings(inputStream)
+  -> new BanzaiApplication(...)
+  -> new FileStoreFactory(settings)
+  -> new ScreenLogFactory(...)
+  -> new DefaultMessageFactory()
+  -> new SocketInitiator(...)
+  -> banzai.logon()
+  -> initiator.start()
+  -> 创建 Session / 主动连接 localhost:9876
+```
+
+```text
+二、FIX 会话建立（Logon）
+
+Banzai(Session)
+  -> Session.next()
+  -> generateLogon()
+  -> initializeHeader(...)
+  -> sendRaw(Logon)
+  -> 通过网络发给 OrderMatch
+
+OrderMatch(IO)
+  -> AbstractIoHandler.messageReceived()
+  -> MessageSessionUtils.parse(...)
+  -> Session.next(message)
+  -> nextLogon(message)
+  -> 状态机确认登录成功
+  -> application.onLogon(sessionID)
+
+OrderMatch(Session)
+  -> 回发 Logon
+
+Banzai(IO)
+  -> AbstractIoHandler.messageReceived()
+  -> MessageSessionUtils.parse(...)
+  -> Session.next(message)
+  -> nextLogon(message)
+  -> 状态机确认登录成功
+  -> application.onLogon(sessionID)
+```
+
+```text
+三、用户在 Banzai 下单
+
+用户点击 Submit
+  -> OrderEntryPanel.SubmitListener.actionPerformed(...)
+  -> application.send(order)
+  -> send42(order)                   // 当前学习环境是 FIX 4.2
+  -> new quickfix.fix42.NewOrderSingle(...)
+  -> populateOrder(order, message)
+  -> Session.sendToTarget(message, sessionID)
+  -> Session.lookupSession(sessionID)
+  -> session.send(message)
+  -> initializeHeader(...)
+  -> application.toApp(...)
+  -> 持久化到 MessageStore
+  -> responder.send(messageString)
+  -> 通过网络发给 OrderMatch
+```
+
+```text
+四、OrderMatch 收到订单并进入业务处理
+
+OrderMatch(IO)
+  -> AbstractIoHandler.messageReceived()
+  -> sessionLog.onIncoming(raw FIX string)
+  -> MessageSessionUtils.parse(session, raw)
+       -> 读取 8=FIX.4.2
+       -> 读取 35=D
+       -> DefaultMessageFactory.create(beginString, msgType)
+       -> 创建 quickfix.fix42.NewOrderSingle
+       -> message.parse(...)
+  -> Session.next(message)
+  -> verify / DataDictionary 校验 / Session 状态检查
+  -> application.fromApp(message, sessionID)
+
+OrderMatch(Application)
+  -> fromApp(Message, SessionID)
+  -> crack(message, sessionID)
+  -> onMessage(NewOrderSingle, SessionID)
+  -> 读取 Header 和 Body 字段
+  -> 构造业务 Order
+  -> processOrder(order)
+       -> acceptOrder(order) 或 rejectOrder(order)
+       -> 如有撮合则 fillOrder(order)
+  -> updateOrder(order, status) / rejectOrder(...)
+  -> new ExecutionReport(...)
+  -> Session.sendToTarget(fixOrder, senderCompId, targetCompId)
+```
+
+```text
+五、ExecutionReport 返回到 Banzai
+
+Banzai(IO)
+  -> AbstractIoHandler.messageReceived()
+  -> MessageSessionUtils.parse(...)
+  -> Session.next(message)
+  -> BanzaiApplication.fromApp(message, sessionID)
+  -> SwingUtilities.invokeLater(new MessageProcessor(...))
+  -> MessageProcessor.run()
+       -> 如果 35=8，则 executionReport(message, sessionID)
+       -> 更新 OrderTableModel
+       -> 更新 ExecutionTableModel
+       -> UI 显示 NEW / FILLED / REJECTED 等状态
+```
+
+```text
+六、会话结束（Logoff）
+
+Banzai 菜单 Logoff
+  -> Banzai.logout()
+  -> Session.lookupSession(sessionId).logout("user requested")
+  -> Session.next() 后续调度中生成 Logout
+  -> generateLogout(...)
+  -> 发给 OrderMatch
+
+OrderMatch(Session)
+  -> nextLogout(message)
+  -> 如本端尚未发 Logout，则 generateLogout(response)
+  -> disconnect(...)
+  -> application.onLogout(sessionID)
+
+Banzai(Session)
+  -> 收到 Logout response
+  -> nextLogout(message)
+  -> disconnect(...)
+  -> application.onLogout(sessionID)
+```
+
+```text
+七、服务停止
+
+OrderMatch
+  -> 控制台输入 #quit
+  -> acceptor.stop()
+  -> logoutAllSessions(...)
+  -> stopAcceptingConnections()
+  -> stopSessionTimer()
+  -> unregisterSessions(...)
+  -> 进程退出
+
+Banzai
+  -> 先 Logoff 可正常结束 FIX 会话
+  -> 关闭窗口则结束 UI / JVM 进程
+```
+
+### 6. 读源码时建议对照的关键文件
+
+```text
+启动入口
+- quickfixj-examples/ordermatch/.../Main.java
+- quickfixj-examples/banzai/.../Banzai.java
+
+应用层回调
+- quickfixj-examples/ordermatch/.../Application.java
+- quickfixj-examples/banzai/.../BanzaiApplication.java
+- quickfixj-examples/banzai/.../ui/OrderEntryPanel.java
+
+引擎核心
+- quickfixj-core/src/main/java/quickfix/Session.java
+- quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java
+- quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java
+- quickfixj-core/src/main/java/quickfix/MessageCracker.java
+- quickfixj-core/src/main/java/quickfix/mina/AbstractIoHandler.java
 ```
 
 ---
