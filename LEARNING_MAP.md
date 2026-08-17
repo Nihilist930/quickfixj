@@ -170,14 +170,182 @@ method.invoke(target, msg, sid)
 onMessage(具体消息类型, SessionID)
 ```
 
+### 4.3 OrderMatch：从 `crack(...)` 到 `onMessage(...)` 的完整流程
+
+相关源码：
+
+```text
+业务处理器
+- quickfixj-examples/ordermatch/src/main/java/
+  quickfix/examples/ordermatch/Application.java
+
+强类型分派器
+- quickfixj-core/src/main/java/quickfix/MessageCracker.java
+
+按 FIX 版本创建消息对象
+- quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java
+```
+
+#### A. 启动阶段：扫描并登记处理器
+
+```text
+创建 OrderMatch Application
+        │
+        ▼
+Application extends MessageCracker
+        │
+        ▼
+MessageCracker 构造函数
+initialize(this)
+        │
+        ▼
+扫描 Application 的所有 public 方法
+        │
+        ▼
+筛选处理器方法：
+
+方法名为 onMessage，或标有 @Handler
+      +
+恰好两个参数
+      +
+参数一是 Message 的子类
+      +
+参数二是 SessionID
+        │
+        ▼
+发现：
+onMessage(NewOrderSingle, SessionID)
+        │
+        ▼
+读取第一个参数的 Java 类型：
+quickfix.fix42.NewOrderSingle.class
+        │
+        ▼
+建立 invokers 映射表：
+
+quickfix.fix42.NewOrderSingle.class
+        │
+        └──> Application.onMessage(NewOrderSingle, SessionID)
+
+quickfix.fix42.OrderCancelRequest.class
+        │
+        └──> Application.onMessage(OrderCancelRequest, SessionID)
+
+quickfix.fix42.MarketDataRequest.class
+        │
+        └──> Application.onMessage(MarketDataRequest, SessionID)
+```
+
+#### B. 收到订单阶段：原始 FIX 报文变成强类型对象
+
+```text
+Banzai 发送原始 FIX 报文
+
+8=FIX.4.2 | 35=D | 49=BANZAI | 56=EXEC | 11=... | 55=AAPL | ...
+        │           │
+        │           └─ MsgType：NewOrderSingle
+        │
+        └─ BeginString：FIX 4.2
+        │
+        ▼
+QuickFIX/J 解析器
+        │
+        ▼
+DefaultMessageFactory
+        │
+        ▼
+选择版本工厂：
+quickfix.fix42.MessageFactory
+        │
+        ▼
+根据 35=D 创建具体对象：
+new quickfix.fix42.NewOrderSingle()
+        │
+        ▼
+填充 Header / Body / Trailer 中的字段
+        │
+        ▼
+Session.next(message)
+        │
+        ▼
+OrderMatch.Application.fromApp(Message, SessionID)
+```
+
+> 此时变量的声明类型是 `Message`，但对象实际类型已是 `quickfix.fix42.NewOrderSingle`。
+
+#### C. 分派阶段：`crack(...)` 查表并反射调用
+
+```text
+Application.fromApp(Message message, SessionID sessionId)
+        │
+        ▼
+crack(message, sessionId)
+        │
+        ▼
+message.getClass()
+        │
+        ▼
+quickfix.fix42.NewOrderSingle.class
+        │
+        ▼
+invokers.get(quickfix.fix42.NewOrderSingle.class)
+        │
+        ▼
+找到启动时注册的 Invoker：
+
+目标对象：OrderMatch Application 实例
+目标方法：onMessage(NewOrderSingle, SessionID)
+        │
+        ▼
+method.invoke(target, message, sessionId)
+        │
+        ▼
+等价于概念上的直接调用：
+
+this.onMessage((NewOrderSingle) message, sessionId)
+        │
+        ▼
+OrderMatch.Application.onMessage(NewOrderSingle, SessionID)
+        │
+        ▼
+读取 11 / 55 / 54 / 40 / 38 等订单字段
+        │
+        ▼
+processOrder(order)
+```
+
+#### D. 没有匹配处理器时的兜底路径
+
+```text
+收到某种业务消息
+        │
+        ▼
+message.getClass() 无法在 invokers 中找到处理器
+        │
+        ▼
+MessageCracker.onMessage(Message, SessionID)
+        │
+        ▼
+抛出 UnsupportedMessageType
+        │
+        ▼
+QuickFIX/J 生成对应的业务拒绝处理
+```
+
 ### 记忆结论
 
 ```text
-不是按 35=D 直接找方法名
-而是：
+35=D 的职责：
+帮助解析器创建 quickfix.fix42.NewOrderSingle 对象
 
-初始化时：按 handler 第一个参数类型建表
-运行时  ：按 message.getClass() 查表
+crack(...) 的职责：
+按 message.getClass() 在 invokers 映射表中找处理器
+
+onMessage(...) 的执行方式：
+MessageCracker 通过反射 method.invoke(...) 调用
+
+因此：
+35=D -> 强类型 Message 对象 -> message.getClass() -> onMessage(具体类型,...)
 ```
 
 ---
@@ -435,7 +603,135 @@ SessionID 标识“这条消息属于哪个会话”
 
 ---
 
-## 10. 复习路线
+## 10. OrderMatch 与 Executor：两个 Acceptor 示例的定位对照
+
+```text
+                              Banzai（Initiator）
+                                      │
+                  ┌───────────────────┴───────────────────┐
+                  │                                       │
+                  ▼                                       ▼
+        OrderMatch（单版本撮合示例）             Executor（多版本执行示例）
+```
+
+### 10.1 连接与协议能力
+
+```text
+OrderMatch
+├─ 角色：Acceptor
+├─ 默认协议：FIX.4.2
+├─ 监听端口：9876
+├─ 本地 Session：FIX.4.2:EXEC->BANZAI
+└─ 配对学习配置：Banzai FIX.4.2 连接 9876
+
+Executor
+├─ 角色：Acceptor
+├─ 默认协议：FIX.4.0、4.1、4.2、4.3、4.4、FIXT.1.1/FIX.5.0
+├─ 监听端口：9876 到 9881（每版本一个端口）
+├─ 本地身份：EXEC->BANZAI
+└─ 可直接与默认 banzai.cfg 的多 Session 配对
+```
+
+```text
+Banzai 默认多版本连接
+
+FIX.4.0:BANZAI->EXEC  ── 9876 ──> Executor FIX.4.0:EXEC->BANZAI
+FIX.4.1:BANZAI->EXEC  ── 9877 ──> Executor FIX.4.1:EXEC->BANZAI
+FIX.4.2:BANZAI->EXEC  ── 9878 ──> Executor FIX.4.2:EXEC->BANZAI
+FIX.4.3:BANZAI->EXEC  ── 9879 ──> Executor FIX.4.3:EXEC->BANZAI
+FIX.4.4:BANZAI->EXEC  ── 9880 ──> Executor FIX.4.4:EXEC->BANZAI
+FIXT.1.1:BANZAI->EXEC ── 9881 ──> Executor FIXT.1.1:EXEC->BANZAI
+```
+
+> `OrderMatch` 与 `Executor` 都会占用 `9876`；两者不能同时使用默认端口运行。
+
+### 10.2 业务行为对照
+
+```text
+OrderMatch：模拟订单簿与撮合
+
+Banzai 发 Buy Limit AAPL
+        │
+        ▼
+OrderMatch 将订单放入内存订单簿
+        │
+        ▼
+先回 ExecutionReport：New
+        │
+        ▼
+等待可匹配的反向订单
+        │
+        ▼
+价格/方向匹配
+        │
+        ▼
+双方订单获得 Filled 或 Partially Filled 回报
+```
+
+```text
+Executor：模拟执行服务
+
+Banzai 发 NewOrderSingle
+        │
+        ▼
+Executor 校验订单类型与市场价格配置
+        │
+        ▼
+先回 ExecutionReport：New
+        │
+        ▼
+订单达到可执行条件？
+   ┌────┴────┐
+   │ 是      │ 否
+   ▼         ▼
+回 Filled   保持 New
+```
+
+```text
+核心差异
+
+OrderMatch：成交依赖另一笔相反方向、可匹配的订单
+Executor  ：成交依赖模拟价格 / AlwaysFillLimitOrders 等执行条件
+```
+
+### 10.3 源码结构与学习价值
+
+```text
+OrderMatch Application
+├─ FIX.4.2 的 onMessage(NewOrderSingle)
+├─ OrderMatcher：维护内存订单簿
+├─ Order：领域订单对象
+└─ 重点：单一协议版本下的订单接收、撮合、撤单、市场数据请求
+
+Executor Application
+├─ onMessage(fix40.NewOrderSingle)
+├─ onMessage(fix41.NewOrderSingle)
+├─ onMessage(fix42.NewOrderSingle)
+├─ onMessage(fix43.NewOrderSingle)
+├─ onMessage(fix44.NewOrderSingle)
+├─ onMessage(fix50.NewOrderSingle)
+├─ validateOrder：订单类型与市场价格校验
+└─ 重点：同一业务语义在多 FIX 版本中如何被强类型分派和生成回报
+```
+
+### 记忆结论
+
+```text
+学习 OrderMatch：
+理解一条 FIX.4.2 订单如何进入业务逻辑、订单簿和撮合流程
+
+学习 Executor：
+理解多协议版本如何由 MessageFactory + MessageCracker
+分派到不同的 onMessage(fixXX.NewOrderSingle, ...) 方法
+
+选择建议：
+单版本端到端消息链路 -> OrderMatch
+多版本差异、订单校验与模拟执行 -> Executor
+```
+
+---
+
+## 11. 复习路线
 
 ### 10.1 五分钟复习
 
