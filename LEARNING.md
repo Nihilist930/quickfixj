@@ -1,8 +1,8 @@
 # QuickFIX/J 学习路线与进度
 
 > 学习分支：`learning/ordermatch`  
-> 最后更新：2026-08-17  
-> 当前阶段：阶段二（理解消息模型与字典，已开始）
+> 最后更新：2026-08-18  
+> 当前阶段：阶段三（理解 Session 引擎，准备开始）
 
 本文件是本地学习的恢复入口。每次继续前，先读 **当前进度** 与 **下一步**。
 
@@ -29,16 +29,26 @@
 - [x] 确认 `ExecutionReport` 在 `ordermatch` 示例中的创建位置与发送 API。
 - [x] 梳理从服务启动、Logon、下单、回报到 Logoff/停止的完整主流程。
 
-### 阶段二：理解消息模型与字典（进行中）
+### 阶段二：理解消息模型与字典（已完成）
 
 - [x] 确认当前学习环境固定在 FIX 4.2：`Banzai` 默认加载 `banzai_ordermatch.cfg`，其 `BeginString=FIX.4.2`、`DataDictionary=FIX42.xml`。
 - [x] 对照 `quickfixj-messages-fix42/pom.xml` 与 `quickfixj-messages-fix44/pom.xml`，理解各协议版本消息模块会分别打包自己的字典 XML 与强类型消息类。
 - [x] 建立“协议版本 -> 字典文件 -> Java 强类型消息包”的对应关系：例如 FIX 4.2 对应 `FIX42.xml` 与 `quickfix.fix42.*`。
-- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/FieldMap.java`，理解字段容器、Header/Body/Trailer 的公共存储结构。
-- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/Message.java`，理解消息对象的整体结构与 parse/set/get 的入口。
-- [ ] 阅读 `quickfixj-base/src/main/java/quickfix/DataDictionary.java`，理解字段校验、必填校验、枚举值校验的规则来源。
-- [ ] 结合 `quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java`，继续理解原始字符串如何被解析成强类型消息对象。
-- [ ] 结合 `quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java`，理解 `BeginString + MsgType` 如何决定具体消息类。
+- [x] 阅读 `quickfixj-base/src/main/java/quickfix/FieldMap.java`，理解字段容器、Header/Body/Trailer 的公共存储结构。
+- [x] 阅读 `quickfixj-base/src/main/java/quickfix/Message.java`，理解消息对象的整体结构与 parse/set/get 的入口。
+- [x] 阅读 `quickfixj-base/src/main/java/quickfix/DataDictionary.java`，理解字段校验、必填校验、枚举值校验的规则来源。
+- [x] 结合 `quickfixj-core/src/main/java/quickfix/MessageSessionUtils.java`，理解原始字符串如何被解析成强类型消息对象。
+- [x] 结合 `quickfixj-core/src/main/java/quickfix/DefaultMessageFactory.java`，理解 `BeginString + MsgType` 如何决定具体消息类。
+
+阶段二的核心产出：
+
+```text
+FieldMap 负责“字段怎么存”
+Message 负责“消息怎么组织成 Header / Body / Trailer”
+DataDictionary 负责“这样组织对不对、字段是否合法”
+DefaultMessageFactory 负责“BeginString + MsgType -> 具体强类型 Message 类”
+MessageSessionUtils / Message.fromString 负责“原始 FIX 字符串 -> 强类型消息对象”
+```
 
 当前本地配对：
 
@@ -350,9 +360,146 @@ Banzai
 
 ---
 
-## 全项目学习框架
+## 阶段二复盘：5 个问题与对应回答
 
-### 阶段一：先学会使用（当前）
+### 问题 1：`FieldMap`、`Message`、`DataDictionary` 各自负责什么？
+
+```text
+FieldMap
+  = 字段容器
+  = 负责 Tag -> Value 与重复组（Group）的存储和读取
+
+Message
+  = 一条完整 FIX 消息对象
+  = Header + Body + Trailer
+  = 其中 Header、Body、Trailer 本质上都建立在 FieldMap 之上
+
+DataDictionary
+  = FIX 协议规则书 / 字典
+  = 负责定义字段、消息类型、必填字段、枚举值、字段类型、重复组规则
+```
+
+一句话记忆：
+
+```text
+FieldMap 负责“装字段”
+Message 负责“组织成一条消息”
+DataDictionary 负责“定义这条消息是否合法”
+```
+
+### 问题 2：原始 FIX 字符串是如何变成强类型消息对象的？
+
+```text
+原始 FIX 字符串
+  -> MessageSessionUtils.parse(...)
+  -> 读取 8=BeginString 和 35=MsgType
+  -> DefaultMessageFactory.create(beginString, msgType)
+  -> 创建对应版本、对应类型的强类型消息对象
+  -> Message.fromString(...)
+  -> 用 FieldMap 把字段填入 Header / Body / Trailer
+  -> 得到例如 quickfix.fix42.NewOrderSingle 这样的对象
+```
+
+一句话记忆：
+
+```text
+8 和 35 先决定“创建哪个 Message 类”
+fromString 再决定“把具体字段填进去”
+```
+
+### 问题 3：`DataDictionary` 在解析和校验时具体起什么作用？
+
+```text
+解析阶段：
+- 判断字段属于 Header / Body / Trailer 哪一部分
+- 判断某字段是否是重复组起点
+- 指导重复组如何展开
+
+校验阶段：
+- 检查 MsgType 是否存在
+- 检查必填字段是否缺失
+- 检查字段是否属于该消息类型
+- 检查字段类型是否正确
+- 检查枚举值是否合法
+- 检查 NumInGroup 与实际组数量是否一致
+```
+
+一句话记忆：
+
+```text
+DataDictionary 既参与“怎么解析”，也参与“解析完是否合规”
+```
+
+### 问题 4：为什么说 `Message` 和 `FieldMap` 是“实例数据层”，`DataDictionary` 是“规则层”？
+
+```text
+Message / FieldMap
+  存的是“这一条具体消息现在有哪些字段、字段值是什么”
+
+DataDictionary
+  存的是“这一类消息允许有哪些字段、字段类型是什么、哪些是必填”
+```
+
+类比：
+
+```text
+Message = 一张已经填好的表单
+FieldMap = 表单里的字段容器
+DataDictionary = 填表规则与模板说明书
+```
+
+### 问题 5：阶段二里 `DefaultMessageFactory`、`Message`、`DataDictionary` 之间是什么关系？
+
+```text
+DefaultMessageFactory
+  负责：先创建“哪一个 Java 消息类”
+
+Message
+  负责：承载这条消息的 Header / Body / Trailer 数据
+
+DataDictionary
+  负责：告诉 Message 解析时怎么分区、怎么识别 Group、怎么做字段合法性校验
+```
+
+三者串联关系：
+
+```text
+BeginString + MsgType
+  -> DefaultMessageFactory.create(...)
+  -> 生成强类型 Message 对象
+  -> Message.fromString(...)
+  -> 借助 DataDictionary 完成解析与校验
+```
+
+---
+
+## 下一步：进入阶段三（理解 Session 引擎）
+
+目标：理解 Logon、心跳、序号、断线、重传和状态机，建立“会话引擎如何驱动整个 FIX 生命周期”的整体认知。
+
+### 阶段三建议先看的一条主线
+
+```text
+Session.next()
+  -> generateLogon()
+  -> initializeHeader(...)
+  -> sendRaw(...)
+  -> 收到对端消息后再进入 nextLogon / nextLogout / nextQueued
+```
+
+### 阶段三建议优先断点
+
+```text
+quickfixj-core/src/main/java/quickfix/Session.java
+- Session.next()
+- generateLogon()
+- initializeHeader(...)
+- sendRaw(...)
+- nextLogon(...)
+- nextLogout(...)
+```
+
+### 阶段一：先学会使用（已完成）
 
 目标：运行示例，理解 Application 回调、配置、订单收发。
 
