@@ -44,6 +44,10 @@ import quickfix.field.HandlInst;
 import quickfix.field.LastPx;
 import quickfix.field.LastShares;
 import quickfix.field.LeavesQty;
+import quickfix.field.MDEntryPx;
+import quickfix.field.MDEntryType;
+import quickfix.field.MDReqID;
+import quickfix.field.MarketDepth;
 import quickfix.field.LocateReqd;
 import quickfix.field.MsgSeqNum;
 import quickfix.field.MsgType;
@@ -63,6 +67,8 @@ import quickfix.field.TargetCompID;
 import quickfix.field.Text;
 import quickfix.field.TimeInForce;
 import quickfix.field.TransactTime;
+import quickfix.fix42.MarketDataRequest;
+import quickfix.fix42.MarketDataSnapshotFullRefresh;
 
 import javax.swing.*;
 import java.math.BigDecimal;
@@ -96,6 +102,9 @@ public class BanzaiApplication implements Application {
 
     public void onLogon(SessionID sessionID) {
         observableLogon.logon(sessionID);
+        if (sessionID.getBeginString().equals(FixVersions.BEGINSTRING_FIX42)) {
+            requestMarketData("AAPL", sessionID);
+        }
     }
 
     public void onLogout(SessionID sessionID) {
@@ -120,6 +129,41 @@ public class BanzaiApplication implements Application {
         }
     }
 
+    public void requestMarketData(String symbol, SessionID sessionID) {
+        try {
+            MarketDataRequest request = new MarketDataRequest(
+                    new MDReqID("MD-" + System.currentTimeMillis()),
+                    new quickfix.field.SubscriptionRequestType(
+                            quickfix.field.SubscriptionRequestType.SNAPSHOT),
+                    new MarketDepth(0));
+
+            MarketDataRequest.NoMDEntryTypes entryType = new MarketDataRequest.NoMDEntryTypes();
+            entryType.set(new MDEntryType(MDEntryType.BID));
+            request.addGroup(entryType);
+
+            MarketDataRequest.NoRelatedSym relatedSymbol = new MarketDataRequest.NoRelatedSym();
+            relatedSymbol.set(new Symbol(symbol));
+            request.addGroup(relatedSymbol);
+
+            send(request, sessionID);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void marketDataSnapshot(MarketDataSnapshotFullRefresh message, SessionID sessionID)
+            throws FieldNotFound {
+        int count = message.getInt(quickfix.field.NoMDEntries.FIELD);
+        MarketDataSnapshotFullRefresh.NoMDEntries entry = new MarketDataSnapshotFullRefresh.NoMDEntries();
+        for (int i = 1; i <= count; i++) {
+            message.getGroup(i, entry);
+            System.out.println("Market data: session=" + sessionID
+                    + ", symbol=" + message.getString(Symbol.FIELD)
+                    + ", entryType=" + entry.getChar(MDEntryType.FIELD)
+                    + ", price=" + entry.getDouble(MDEntryPx.FIELD));
+        }
+    }
+
     public class MessageProcessor implements Runnable {
         private final quickfix.Message message;
         private final SessionID sessionID;
@@ -132,7 +176,9 @@ public class BanzaiApplication implements Application {
         public void run() {
             try {
                 MsgType msgType = new MsgType();
-                if (isAvailable) {
+                if (message instanceof MarketDataSnapshotFullRefresh) {
+                    marketDataSnapshot((MarketDataSnapshotFullRefresh) message, sessionID);
+                } else if (isAvailable) {
                     if (isMissingField) {
                         // For OpenFIX certification testing
                         sendBusinessReject(message, BusinessRejectReason.CONDITIONALLY_REQUIRED_FIELD_MISSING, "Conditionally required field missing");

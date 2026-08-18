@@ -2,7 +2,7 @@
 
 > 类型：长期演进路线图  
 > 适用范围：从 QuickFIX/J 示例走向更贴近海外机构买方的本地实战项目  
-> 基础起点：`Banzai + OrderMatch` 已跑通，当前准备进入 Session 引擎学习阶段
+> 基础起点：`Banzai + OrderMatch` 已跑通，`Banzai + Executor` 的多版本联调作为阶段三实验待确认
 
 本文件不是源码阅读清单，而是按“买方系统能力层次 + 可落地小项目 + 对应示例映射”组织的长期路线图。
 
@@ -153,6 +153,229 @@ OrderMatch 侧
 - OrderMatch 可以返回 MarketDataSnapshotFullRefresh
 - Banzai 界面能显示某个 Symbol 的 Bid / Ask / Last（哪怕是简化版）
 - 用户可基于界面价格继续发单
+```
+
+### 4.6 从一次快照扩展到持续订阅
+
+当前最小实现是一次性快照：
+
+```text
+Banzai
+  │
+  │ MarketDataRequest（35=V，263=0 Snapshot）
+  ▼
+OrderMatch.onMessage(MarketDataRequest, ...)
+  │
+  ▼
+MarketDataSnapshotFullRefresh（35=W）
+  │
+  ▼
+Banzai.fromApp(...)
+  │
+  ▼
+控制台打印一次行情
+```
+
+持续订阅使用 `SubscriptionRequestType(263)` 表示订阅语义：
+
+```text
+263=0  -> Snapshot：只返回一次快照
+263=1  -> Snapshot + Updates：返回初始快照并持续更新
+263=2  -> Disable previous subscription：取消指定订阅
+```
+
+持续订阅后的目标链路：
+
+```text
+Banzai 登录成功
+  │
+  ▼
+发送 MarketDataRequest
+  ├─ MDReqID（262）
+  ├─ SubscriptionRequestType=1（263）
+  ├─ NoMDEntryTypes（267）
+  └─ NoRelatedSym（146）
+  │
+  ▼
+OrderMatch.onMessage(MarketDataRequest, ...)
+  │
+  ├─ 校验订阅请求
+  ├─ 保存 SessionID + MDReqID + Symbol + EntryType
+  └─ 立即返回初始 MarketDataSnapshotFullRefresh（35=W）
+       │
+       ▼
+Banzai.fromApp(...)
+  │
+  ▼
+打印初始行情
+
+之后由 OrderMatch 的行情发布任务驱动：
+
+定时器 / 行情事件
+  │
+  ▼
+读取当前价格
+  │
+  ▼
+遍历有效订阅
+  │
+  ▼
+向每个 Session 发送 MarketDataSnapshotFullRefresh（35=W）
+  │
+  ▼
+Banzai.fromApp(...)
+  │
+  ▼
+持续打印价格更新
+```
+
+### 4.7 第一版订阅更新的推荐实现边界
+
+第一版先采用“重复发送完整快照”，不立即引入增量行情：
+
+```text
+第一版：
+初始快照 -> 35=W
+后续变化 -> 继续发送 35=W
+
+后续进阶：
+初始快照 -> 35=W
+价格变化 -> 35=X MarketDataIncrementalRefresh
+```
+
+```text
+第一版只支持：
+├─ 一个 FIX Session
+├─ 一个或少量 Symbol
+├─ BID / OFFER / TRADE 中的一个或几个 EntryType
+├─ 定时生成模拟价格，验证协议链路
+└─ Banzai 控制台打印，不修改 UI
+```
+
+```text
+不建议第一版直接做：
+├─ 真实外部行情接入
+├─ 复杂增量行情序列
+├─ 多市场深度簿
+└─ UI 行情表格
+```
+
+### 4.8 OrderMatch 侧的订阅生命周期
+
+```text
+MarketDataRequest（263=1）
+  │
+  ▼
+SubscriptionRegistry
+  └─ SessionID
+      └─ MDReqID
+          ├─ Symbol
+          ├─ EntryType
+          └─ Active
+```
+
+订阅更新：
+
+```text
+行情定时器 / 订单簿变化
+  │
+  ▼
+MarketDataPublisher
+  │
+  ▼
+查找有效订阅
+  │
+  ▼
+构造 MarketDataSnapshotFullRefresh
+  │
+  ▼
+Session.send(message)
+```
+
+取消订阅：
+
+```text
+Banzai
+  │
+  │ MarketDataRequest（263=2，携带原 MDReqID）
+  ▼
+OrderMatch.onMessage(MarketDataRequest, ...)
+  │
+  ▼
+根据 SessionID + MDReqID 删除订阅
+  │
+  ▼
+后续行情发布不再向该订阅发送
+```
+
+会话断开时清理：
+
+```text
+OrderMatch.onLogout(SessionID)
+  │
+  ▼
+删除该 SessionID 下的全部订阅
+  │
+  ▼
+避免定时任务向已断开的 Session 持续发送
+```
+
+### 4.9 行情价格来源的演进
+
+```text
+第一阶段：模拟行情
+  123.45 -> 123.46 -> 123.44 -> 123.47
+       │
+       ▼
+验证订阅建立、周期发送和 Banzai 接收
+```
+
+```text
+第二阶段：OrderMatch 订单簿驱动
+
+订单进入 OrderMatcher
+  │
+  ▼
+Market.bidOrders / askOrders 变化
+  │
+  ▼
+计算 Best Bid / Best Ask / Last Trade
+  │
+  ▼
+生成行情事件
+  │
+  ▼
+通知订阅者
+```
+
+```text
+第三阶段：独立行情提供者
+
+MarketDataProvider
+  │
+  ▼
+接收外部行情
+  │
+  ▼
+MarketDataEvent
+  │
+  ▼
+订阅分发器
+  │
+  ▼
+FIX Session
+```
+
+### 4.10 P1 订阅更新的完成标志
+
+```text
+- Banzai 发出 263=1 的 MarketDataRequest
+- OrderMatch 保存 SessionID / MDReqID / Symbol 订阅关系
+- OrderMatch 立即返回初始快照
+- OrderMatch 定时推送后续行情
+- Banzai 控制台能连续打印同一 Symbol 的价格更新
+- Banzai 发出 263=2 后不再收到该订阅更新
+- Logout 或断线后 OrderMatch 清理对应订阅
 ```
 
 ---

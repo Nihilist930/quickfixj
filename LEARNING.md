@@ -2,7 +2,7 @@
 
 > 学习分支：`learning/ordermatch`  
 > 最后更新：2026-08-18  
-> 当前阶段：阶段三（理解 Session 引擎，准备开始）
+> 当前阶段：阶段三（理解 Session 引擎，正在开始）
 
 本文件是本地学习的恢复入口。每次继续前，先读 **当前进度** 与 **下一步**。
 
@@ -562,6 +562,26 @@ Heartbeat / TestRequest
 ResendRequest
 断线重连与 Store
 ```
+
+### 阶段三：理解 Session 引擎（当前进行中）
+
+- [ ] 阅读 `quickfixj-core/src/main/java/quickfix/Session.java` 的 `next()`，理解定时驱动入口。
+- [ ] 追踪 `generateLogon()`、`initializeHeader(...)`、`sendRaw(...)` 的出站 Logon 流程。
+- [ ] 追踪 `nextLogon(...)`、`nextLogout(...)` 的入站会话状态转换。
+- [ ] 观察 `MsgSeqNum(34)`、Heartbeat、TestRequest、Logout 和断线重连。
+- [ ] 使用 Banzai + Executor 做多 FIX 版本 Session 联调，确认 `fix40` 到 `fix50` 的强类型分派。
+
+阶段三的入口主线：
+
+```text
+Session.next()
+  -> generateLogon()
+  -> initializeHeader(...)
+  -> sendRaw(...)
+  -> 对端消息进入 nextLogon / nextLogout / nextQueued
+```
+
+---
 
 ### 阶段四：并发、存储和运维
 
