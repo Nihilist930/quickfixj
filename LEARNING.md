@@ -1,8 +1,8 @@
 # QuickFIX/J 学习路线与进度
 
 > 学习分支：`learning/ordermatch`  
-> 最后更新：2026-08-18  
-> 当前阶段：阶段三（理解 Session 引擎，正在开始）
+> 最后更新：2026-08-19  
+> 当前阶段：阶段三（理解 Session 引擎，正在进行）
 
 本文件是本地学习的恢复入口。每次继续前，先读 **当前进度** 与 **下一步**。
 
@@ -568,7 +568,7 @@ ResendRequest
 - [ ] 阅读 `quickfixj-core/src/main/java/quickfix/Session.java` 的 `next()`，理解定时驱动入口。
 - [ ] 追踪 `generateLogon()`、`initializeHeader(...)`、`sendRaw(...)` 的出站 Logon 流程。
 - [ ] 追踪 `nextLogon(...)`、`nextLogout(...)` 的入站会话状态转换。
-- [ ] 观察 `MsgSeqNum(34)`、Heartbeat、TestRequest、Logout 和断线重连。
+- [x] 结合真实日志观察 `MsgSeqNum(34)`、Heartbeat、TestRequest、Logout 和断线重连。
 - [ ] 使用 Banzai + Executor 做多 FIX 版本 Session 联调，确认 `fix40` 到 `fix50` 的强类型分派。
 
 阶段三的入口主线：
@@ -579,6 +579,115 @@ Session.next()
   -> initializeHeader(...)
   -> sendRaw(...)
   -> 对端消息进入 nextLogon / nextLogout / nextQueued
+```
+
+### 阶段三重点：断线重连与会话恢复
+
+断线重连不是简单地重新建立 TCP 连接，而是恢复一个已经存在的 FIX Session。恢复的核心是：
+
+```text
+TCP 连接断开
+  -> Session 保留本地 MessageStore
+  -> Banzai 按 ReconnectInterval 尝试重连
+  -> 双方重新发送 Logon
+  -> 使用 Store 中保存的发送/接收序号继续通信
+  -> 发现序号缺口后通过 ResendRequest 请求补发
+  -> 对方通过历史消息重发或 SequenceReset/GAP_FILL 跳过空缺
+  -> 双方将会话推进到一致的下一个序号
+```
+
+本次 Banzai 与 Executor/OrderMatch 的恢复日志说明：
+
+```text
+Banzai -> EXEC：35=A, 34=54
+  Banzai 不是从 1 开始，而是继续发送第 54 条消息。
+
+EXEC -> Banzai：35=A, 34=55
+  EXEC 也使用已保存的历史序号继续发送第 55 条消息。
+
+Banzai：MsgSeqNum too high, expecting 52 but received 55
+  Banzai 期望收到 EXEC 的 52，但实际先收到 55，说明 52~54 存在缺口。
+
+Banzai -> EXEC：35=2, 34=55, 7=52, 16=0
+  Banzai 发送 ResendRequest，请 EXEC 从 52 补到最新消息。
+
+EXEC -> Banzai：35=8, 34=52, 43=Y
+  EXEC 重发历史 ExecutionReport；43=Y 表示这是可能重复/恢复场景下的补发消息。
+
+EXEC -> Banzai：35=4, 34=53, 43=Y, 36=57, 123=Y
+  EXEC 用 SequenceReset/GAP_FILL 跳过 53~56，告诉 Banzai 下一条从 57 开始。
+```
+
+#### `MsgSeqNum(34)` 的含义
+
+```text
+34=MsgSeqNum
+= 当前 FIX Session、当前发送方向上的消息序号
+
+Banzai -> EXEC 有一条独立序列
+EXEC -> Banzai 有另一条独立序列
+```
+
+在 QuickFIX/J 中，出站消息的序号由 `Session` 写入 Header：
+
+```text
+Session.initializeHeader(...)
+  -> header.setInt(MsgSeqNum.FIELD, getExpectedSenderNum())
+  -> 从 MessageStore 取得 next sender sequence number
+```
+
+接收时，`Session` 会把收到的 `34` 与本地期望的 `next target sequence number` 比较：
+
+```text
+收到序号 == 期望序号
+  -> 正常处理并递增
+收到序号 > 期望序号
+  -> 发现消息缺口，缓存高序号消息并发送 ResendRequest
+收到序号 < 期望序号
+  -> 可能是重复消息或异常序号，按会话恢复规则处理
+```
+
+#### 断线重连的实际模拟方法
+
+```text
+实验一：保留双方 Store
+1. 启动 Banzai 与 OrderMatch/Executor。
+2. 正常 Logon，并发送几条订单或管理消息。
+3. 停止一端进程，模拟连接断开。
+4. 等待 Banzai 的 ReconnectInterval 到期并自动重连。
+5. 重新启动对端。
+6. 观察重连后的 Logon、34、35=2、35=4 和 43=Y。
+
+实验二：制造序号不一致
+1. 停止双方进程。
+2. 只删除一端的 FileStore，保留另一端的 Store。
+3. 重新启动双方。
+4. 观察双方序号认知不一致时的 Logon、ResendRequest 和 SequenceReset。
+```
+
+对应配置与源码锚点：
+
+```text
+banzai_ordermatch.cfg
+- FileStorePath=target/data/banzai_ordermatch
+- ReconnectInterval=5
+
+ordermatch.cfg
+- FileStorePath=target/data/ordermatch
+
+quickfixj-core/src/main/java/quickfix/Session.java
+- initializeHeader(...)：写入 MsgSeqNum(34)
+- generateLogon(...)：重连后的 Logon
+- nextLogon(...)：处理 Logon 与序号协商
+- nextResendRequest(...)：处理补发请求
+- disconnect(...)：断开与重连状态切换
+```
+
+记忆结论：
+
+```text
+会话恢复 = 连接恢复 + Store 状态恢复 + 序号校准 + 缺失消息恢复
+MsgSeqNum = FIX Header 中的 34 字段，不是全局序号，而是每个 Session、每个方向独立递增
 ```
 
 ---

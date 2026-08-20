@@ -102,9 +102,9 @@ public class BanzaiApplication implements Application {
 
     public void onLogon(SessionID sessionID) {
         observableLogon.logon(sessionID);
-        if (sessionID.getBeginString().equals(FixVersions.BEGINSTRING_FIX42)) {
-            requestMarketData("AAPL", sessionID);
-        }
+//        if (sessionID.getBeginString().equals(FixVersions.BEGINSTRING_FIX42)) {
+//            requestMarketData("AAPL", sessionID);
+//        }
     }
 
     public void onLogout(SessionID sessionID) {
