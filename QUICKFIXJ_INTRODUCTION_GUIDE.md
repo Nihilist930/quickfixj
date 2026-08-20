@@ -756,7 +756,9 @@ QuickFIX/J 告诉你：如何用 FIX 标准把行情、订单、回报和会话�
 
 ## 7. 后续重点：QuickFIX/J 高并发交易处理
 
-高并发是 QuickFIX/J 从示例走向真实交易系统时必须重点理解的主题。这里的“高并发”不是让同一个 FIX Session 内的消息无序并行，而是建立下面的并发模型：
+高并发是 QuickFIX/J 从示例走向真实交易系统时必须重点理解的主题。其最重要的底层基础之一就是 **多 Session 通信**：买方系统可同时维护多个行情源、多个券商、多个交易场所或 Drop Copy 的独立 FIX 会话。
+
+这里的“高并发”不是让同一个 FIX Session 内的消息无序并行，而是建立下面的并发模型：
 
 ```text
 多个 Session 并行
@@ -770,7 +772,156 @@ QuickFIX/J 告诉你：如何用 FIX 标准把行情、订单、回报和会话�
 多实例 / 多进程水平扩展
 ```
 
-### 7.1 QuickFIX/J 的并发架构
+### 7.1 买方多 Session 通信：高并发的会话基础
+
+#### 7.1.1 核心原则
+
+```text
+一个 QuickFIX/J 应用进程
+  └─ 一个 SocketInitiator
+       └─ 根据 SessionSettings 中多个 [session] 创建并管理多条逻辑 Session
+
+每条 Session 都独立拥有：
+- SessionID：逻辑身份与业务路由键
+- TCP 连接及 Logon / Logout 状态
+- Sender / Target MsgSeqNum(34)
+- Heartbeat、TestRequest、重连与重传状态
+- MessageStore、日志和恢复记录
+```
+
+因此，多 Session 不是“把不同对手方的消息混到一条连接中”，而是：
+
+```text
+QuickFIX/J 负责隔离并维护多条 FIX 逻辑会话；
+买方 OMS / EMS 根据 SessionID 把消息路由到正确的行情、订单或回报处理链路。
+```
+
+#### 7.1.2 买方 OMS / EMS 多 Session 总图
+
+```text
+                                     买方 OMS / EMS
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                   │
+│  行情缓存 / 聚合 ──> 策略 / 定价 ──> 风控 / 订单路由 ──> 订单与持仓状态管理         │
+│        ▲                                      │                                  │
+│        │                                      │ 选择目标交易 Session              │
+│        │                                      ▼                                  │
+│  BuySideFixApplication: fromApp(message, sessionID) / send(message, sessionID)    │
+│        │                                      │                                  │
+│        └───────────────────────┬──────────────┘                                  │
+│                                ▼                                                  │
+│                    QuickFIX/J SocketInitiator                                    │
+│      ┌────────────────┬────────────────┬────────────────┬────────────────┐       │
+│      │ 行情 Session A │ 行情 Session B │ 交易 Session A │ 交易 Session B │       │
+│      │ BUY->MD_A      │ BUY->MD_B      │ BUY->BROKER_A  │ BUY->BROKER_B  │       │
+│      │ Store / Seq    │ Store / Seq    │ Store / Seq    │ Store / Seq    │       │
+│      └───────┬────────┴───────┬────────┴───────┬────────┴───────┬────────┘       │
+└──────────────┼────────────────┼────────────────┼────────────────┼────────────────┘
+               ▼                ▼                ▼                ▼
+         行情供应商 A      行情供应商 B        券商 A / 场所 A    券商 B / 场所 B
+```
+
+示例 SessionID：
+
+```text
+FIX.4.4:BUY_SIDE->MD_VENDOR_A     行情源 A
+FIX.4.4:BUY_SIDE->MD_VENDOR_B     行情源 B
+FIX.4.4:BUY_SIDE->BROKER_A        券商 / 场所 A
+FIX.4.4:BUY_SIDE->BROKER_B        券商 / 场所 B
+```
+
+同一个 `Application` 实例可以处理全部 Session 的回调，但它们绝不共享序号和会话状态：
+
+```text
+BUY_SIDE->MD_VENDOR_A 的 MsgSeqNum
+≠ BUY_SIDE->MD_VENDOR_B 的 MsgSeqNum
+≠ BUY_SIDE->BROKER_A 的 MsgSeqNum
+≠ BUY_SIDE->BROKER_B 的 MsgSeqNum
+```
+
+#### 7.1.3 行情与交易的两类通信流程
+
+```text
+行情 Session：收行情
+
+MD_VENDOR_A / MD_VENDOR_B
+  │  MarketDataSnapshotFullRefresh(35=W)
+  │  MarketDataIncrementalRefresh(35=X)
+  ▼
+fromApp(message, sessionID)
+  │
+  ├─ SessionID 确认行情来源
+  ▼
+MarketDataHandler
+  │
+  ▼
+按 symbol + source / sessionID 更新行情缓存
+  │
+  ▼
+策略、定价或行情聚合
+```
+
+```text
+交易 Session：发订单、收执行回报
+
+策略 / OMS / 风控
+  │
+  ▼
+OrderRouter 根据流动性、费用、可用性等规则选择 Broker A 或 Broker B
+  │
+  ▼
+Session.sendToTarget(NewOrderSingle, targetSessionID)
+  │
+  ▼
+Broker / Venue
+  │
+  ▼
+ExecutionReport(35=8)
+  │
+  ▼
+fromApp(executionReport, sessionID)
+  │
+  ├─ SessionID 确认回报所属券商 / 场所
+  └─ ClOrdID / OrderID / ExecID 关联本地订单并更新状态
+```
+
+> 消息类型回答“这是什么消息”；`SessionID` 回答“它来自哪里，或应该发往哪里”。两者必须同时参与业务路由。
+
+#### 7.1.4 隔离、故障与高并发的关系
+
+```text
+MD_VENDOR_A 断线
+  │
+  ▼
+只影响 FIX.4.4:BUY_SIDE->MD_VENDOR_A
+  ├─ 该 Session 独立按 ReconnectInterval 重连
+  ├─ 该 Session 独立根据自己的 Store 恢复 MsgSeqNum
+  ├─ 该 Session 独立处理 ResendRequest / SequenceReset
+  │
+  └─ 不应影响 MD_VENDOR_B、BROKER_A、BROKER_B 的通信
+```
+
+这提供了高并发系统所需的基础隔离：
+
+```text
+连接隔离 + 会话状态隔离 + 对手方隔离 + 业务用途隔离
+```
+
+但要准确区分边界：多 Session 支持 **并行通信和故障隔离**，并不天然等于完整高可用。若全部 Session 位于同一个 JVM，进程崩溃仍会影响全部会话；主备切换、跨机 Store 恢复、监控告警、限流和容量治理仍需要系统层设计。
+
+#### 7.1.5 多 Session 的实现规则
+
+```text
+1. 将 SessionID 视为业务路由键，而非仅用于日志展示。
+2. 每条 Session 的 MsgSeqNum、Store、重传和心跳状态完全独立。
+3. 行情 Session 与交易 Session 在业务层分域；不能混淆其消息和可用性。
+4. 发送消息时显式指定目标：Session.sendToTarget(message, sessionID)。
+5. 接收消息时同时按“消息类型 + SessionID”分派。
+6. 不同 Session 可以并行；同一 Session 的 FIX 协议消息必须保持顺序。
+7. 买方业务层仍要统一维护跨 Session 的行情聚合、订单路由、持仓、风控和审计。
+```
+
+### 7.2 QuickFIX/J 的并发架构
 
 ```text
 多个 FIX Session
