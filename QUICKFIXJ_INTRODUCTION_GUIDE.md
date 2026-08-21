@@ -195,13 +195,136 @@ FIX 协议层
 └─ DataDictionary
 ```
 
-### 3.4 对外介绍时的关键结论
+### 3.4 订单标识与订单状态管理
 
-> 一笔订单的业务含义由 OMS、EMS、风控、撮合等业务系统决定；QuickFIX/J 负责把该业务意图可靠地表达为 FIX 消息，并在对手方之间安全、正确地传递。
+订单链路中不能只关注“订单是否发送成功”，还必须明确不同订单号的来源、生命周期和关联关系。以 `Banzai -> Executor` 为例，至少要区分以下 4 个标识：
+
+```text
+Banzai Order.ID
+  = 买方本地领域订单 ID
+
+ClOrdID(11)
+  = 买方发送给执行端的客户订单 ID
+
+OrderID(37)
+  = Executor / 卖方为订单分配的执行端订单 ID
+
+ExecID(17)
+  = Executor 为每一次执行或回报事件分配的 ID
+```
+
+#### ID 的生成和传递链
+
+```text
+用户点击 Submit
+  -> new Banzai Order()
+  -> Order.generateID()
+  -> 得到本地 Order.ID
+  -> 构造 NewOrderSingle
+  -> ClOrdID(11) = Order.ID
+  -> 发送给 Executor
+  -> Executor 创建 ExecutionReport
+  -> genOrderID() 生成 OrderID(37)
+  -> genExecID() 生成 ExecID(17)
+  -> 回报中同时携带 ClOrdID / OrderID / ExecID
+```
+
+```text
+Banzai                                  Executor
+──────                                  ────────
+Order.ID = C001
+    │
+    └──> NewOrderSingle.ClOrdID(11)=C001
+                                             │
+                                             ▼
+                                  ExecutionReport
+                                  OrderID(37)=O001
+                                  ExecID(17)=E001
+                                  ClOrdID(11)=C001
+```
+
+#### 为什么需要多个 ID
+
+```text
+ClOrdID(11)
+  用于买方把回报关联回自己的本地订单。
+
+OrderID(37)
+  用于执行端在自己的订单系统中识别这笔订单。
+
+ExecID(17)
+  用于区分同一订单生命周期中的不同回报事件。
+```
+
+Banzai 接收 `ExecutionReport` 后，通常通过 `ClOrdID(11)` 找回本地订单：
+
+```text
+ExecutionReport.ClOrdID(11)
+  -> Banzai Order.ID
+  -> 更新订单状态、成交数量、均价和 UI
+```
+
+订单状态可以抽象为：
+
+```text
+本地订单创建
+  -> NewOrderSingle 已发送
+  -> ExecutionReport: New
+  -> Partially Filled
+  -> Filled / Canceled / Rejected
+```
+
+撤单时还要区分原订单和撤单请求：
+
+```text
+原始订单：ClOrdID(11)=C001
+撤单请求：OrigClOrdID(41)=C001，ClOrdID(11)=C002
+```
+
+#### 当前 Executor 示例与生产系统的差异
+
+当前示例在每次构造 `ExecutionReport` 时调用 `genOrderID()`，因此同一订单的 `NEW` 和 `FILLED` 回报可能得到不同的 `OrderID(37)`。这是为了演示回报构造的简化实现。
+
+生产系统通常应保持：
+
+```text
+同一订单生命周期：OrderID(37) 保持不变
+不同回报事件：ExecID(17) 分别递增或唯一
+
+New              OrderID=O001, ExecID=E001
+PartiallyFilled  OrderID=O001, ExecID=E002
+Filled           OrderID=O001, ExecID=E003
+```
+
+因此，订单状态管理的核心不是简单生成一个数字，而是建立稳定的关联关系：
+
+```text
+ClOrdID  -> 买方订单
+OrderID  -> 执行端订单
+ExecID   -> 执行事件
+```
+
+#### 相关示例源码
+
+```text
+Banzai：
+- banzai/Order.java：new Order() 时生成本地 Order.ID
+- banzai/BanzaiApplication.java：将 Order.ID 写入 ClOrdID(11)
+- banzai/BanzaiApplication.java：通过 ClOrdID 找回本地订单
+
+Executor：
+- executor/Application.java：genOrderID() 生成 OrderID(37)
+- executor/Application.java：genExecID() 生成 ExecID(17)
+- executor/Application.java：创建并发送 ExecutionReport
+```
+
+### 3.5 对外介绍时的关键结论
+
+> 一笔订单的业务含义由 OMS、EMS、风控、撮合等业务系统决定；QuickFIX/J 负责把该业务意图可靠地表达为 FIX 消息，并在对手方之间安全、正确地传递。订单状态管理还必须明确 `ClOrdID`、`OrderID` 和 `ExecID` 的生成方、关联方式与生命周期。
 
 ---
 
-## 4. 主线二：领域对象、FIX Message 与原始报文的转换
+## 4. 主线二：领域对象、FIX Message 与原始 FIX 报文的转换
 
 ### 4.1 更严谨的表达
 
@@ -334,9 +457,221 @@ Trailer：完整性校验
 10=...           CheckSum
 ```
 
-### 4.6 对外介绍时的关键结论
+### 4.6 FieldMap 中的 Group：用行情快照理解重复组
 
-> 领域 `Order` 表达“业务想做什么”，`NewOrderSingle` 表达“FIX 协议如何表达这笔订单”，原始 Tag=Value 报文表达“它如何在线路上传输”。三者职责不同，不能混为一谈。
+FIX 消息除了普通的 `Tag -> Value` 字段，还需要表达“同一结构重复出现”的数据。QuickFIX/J 用 `FieldMap` 的 `Group` 表示这种 FIX Repeating Group。
+
+最直观的例子是行情快照：一个 Symbol 同时包含 Bid、Ask，甚至多个深度档位。
+
+```text
+MarketDataSnapshotFullRefresh
+├─ Symbol(55) = AAPL
+└─ NoMDEntries(268) = 2
+   ├─ Group 1
+   │  ├─ MDEntryType(269) = Bid
+   │  ├─ MDEntryPx(270) = 100.10
+   │  └─ MDEntrySize(271) = 1000
+   │
+   └─ Group 2
+      ├─ MDEntryType(269) = Offer / Ask
+      ├─ MDEntryPx(270) = 100.12
+      └─ MDEntrySize(271) = 1200
+```
+
+对应的 FIX 业务字段可以简化为：
+
+```text
+55=AAPL
+268=2
+269=0 | 270=100.10 | 271=1000
+269=1 | 270=100.12 | 271=1200
+```
+
+其中：
+
+```text
+268=2
+  = 后面有 2 条重复行情记录
+
+每一个 Group
+  = 一条完整的 Bid / Ask / 深度行情记录
+```
+
+### 4.6 普通字段与 Group 的内部结构
+
+```text
+普通字段：
+FieldMap.fields
+└─ Tag -> Value
+   55 -> AAPL
+
+重复组：
+FieldMap.groups
+└─ Group 标识字段 -> List<Group>
+   268 -> [
+       {269 -> 0, 270 -> 100.10, 271 -> 1000},
+       {269 -> 1, 270 -> 100.12, 271 -> 1200}
+   ]
+```
+
+因此：
+
+```text
+FieldMap
+├─ fields：保存普通字段
+└─ groups：保存重复组列表
+```
+
+`Message` 负责把这些内容组织到完整消息中：
+
+```text
+Message
+├─ Header：会话字段
+├─ Body：Symbol、NoMDEntries 和 Group 列表
+└─ Trailer：校验字段
+```
+
+### 4.7 Group 的构造与读取
+
+构造行情消息时，业务代码不是手工拼接所有 `Tag=Value`，而是创建强类型 Group 并加入消息：
+
+```java
+MarketDataSnapshotFullRefresh.NoMDEntries bid =
+        new MarketDataSnapshotFullRefresh.NoMDEntries();
+bid.set(new MDEntryType(MDEntryType.BID));
+bid.set(new MDEntryPx(100.10));
+bid.set(new MDEntrySize(1000));
+message.addGroup(bid);
+
+MarketDataSnapshotFullRefresh.NoMDEntries ask =
+        new MarketDataSnapshotFullRefresh.NoMDEntries();
+ask.set(new MDEntryType(MDEntryType.OFFER));
+ask.set(new MDEntryPx(100.12));
+ask.set(new MDEntrySize(1200));
+message.addGroup(ask);
+```
+
+接收方按组的序号读取：
+
+```java
+MarketDataSnapshotFullRefresh.NoMDEntries group =
+        new MarketDataSnapshotFullRefresh.NoMDEntries();
+
+message.getGroup(1, group); // Bid
+double bidPx = group.getDouble(MDEntryPx.FIELD);
+
+message.getGroup(2, group); // Ask
+double askPx = group.getDouble(MDEntryPx.FIELD);
+```
+
+核心流程是：
+
+```text
+addGroup(...)
+  -> FieldMap 保存 Group 列表
+  -> Session 序列化为重复 FIX 字段
+  -> 对端解析 NoMDEntries
+  -> getGroup(index, group)
+  -> 读取每条行情记录
+```
+
+### 4.8 DataDictionary 与 Group 的关系
+
+`FieldMap` 负责“存储 Group”，但不负责定义 Group 的协议规则。Group 的定义来自 `DataDictionary`：
+
+```text
+DataDictionary
+├─ 268 是 NoMDEntries
+├─ 269 是 Group 的起始字段 / delimiter
+├─ 270、271 属于该 Group
+├─ 每组允许哪些字段
+└─ Group 的顺序、类型和数量规则
+```
+
+解析过程可以理解为：
+
+```text
+读到 268=2
+  -> 知道后面有 2 组
+读到第一个 269
+  -> 开始 Group 1
+读到下一个 269
+  -> Group 1 结束，开始 Group 2
+读完 Group 2
+  -> 重复组结束
+```
+
+所以三者关系是：
+
+```text
+DataDictionary
+  = 定义 Group 应该怎样解析、怎样校验
+
+Message
+  = 组织包含 Group 的完整 FIX 消息
+
+FieldMap
+  = 保存普通字段和 Group 列表
+```
+
+### 4.9 行情请求中的 Group
+
+Group 不只出现在行情快照中，行情订阅请求也经常使用 Group：
+
+```text
+MarketDataRequest
+├─ NoMDEntryTypes(267)
+│  ├─ Group 1：Bid
+│  └─ Group 2：Offer
+│
+└─ NoRelatedSym(146)
+   ├─ Group 1：AAPL
+   ├─ Group 2：MSFT
+   └─ Group 3：TSLA
+```
+
+这表达的是：
+
+```text
+一次请求订阅多个行情类型
+一次请求订阅多个 Symbol
+```
+
+### 4.10 Group 的实战意义
+
+在行情系统中：
+
+```text
+一个 Group = 一条 Bid / Ask / 深度行情
+多个 Group = 一个 Symbol 的行情集合或订单簿档位
+```
+
+例如：
+
+```text
+AAPL
+├─ Bid Level 1
+├─ Bid Level 2
+├─ Ask Level 1
+└─ Ask Level 2
+```
+
+因此 Group 不只是“重复字段的语法”，而是表达以下结构化业务数据的基础：
+
+```text
+- 行情档位
+- 多个订阅 Symbol
+- 多种行情类型
+- 订单分配明细
+- 执行明细
+- 账户或持仓明细
+```
+
+> 理解 Group，是从“会读取普通 FIX 字段”进入“能处理真实复杂 FIX 消息”的关键一步。
+
+### 4.11 对外介绍时的关键结论
+
+> `FieldMap.fields` 保存普通字段，`FieldMap.groups` 保存重复结构；`Message` 负责组织完整消息，`DataDictionary` 定义 Group 的起始字段、成员字段、顺序和校验规则。在行情场景中，一个 Group 表示一条 Bid、Ask 或深度行情记录，多个 Group 共同构成一个 Symbol 的行情集合。
 
 ---
 
