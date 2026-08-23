@@ -1,4 +1,4 @@
-# QuickFIX/J 介绍纲领：从业务流程到会话可靠性
+# QuickFIX/J 自学纲领：从业务流程到会话可靠性
 
 > **目标**：用一笔订单说明业务如何接入，用消息转换说明 FIX 协议如何落地，用会话恢复说明生产环境如何保证通信可靠。  
 > **适用场景**：学习 QuickFIX/J、向团队介绍 FIX 接入架构、准备 30～45 分钟的技术分享。
@@ -318,7 +318,195 @@ Executor：
 - executor/Application.java：创建并发送 ExecutionReport
 ```
 
-### 3.5 对外介绍时的关键结论
+### 3.5 Banzai 到 Executor：一笔订单与 `ExecutionReport` 的完整链路
+
+本节以默认多版本配置中的 FIX 4.2 会话为例：
+
+```text
+Banzai 本地 Session：  FIX.4.2:BANZAI->EXEC
+Executor 本地 Session：FIX.4.2:EXEC->BANZAI
+默认监听端口：9878
+```
+
+`Executor` 不维护像 `OrderMatch` 那样的订单簿撮合；它校验订单后先回一条“已接收”回报，若订单满足其模拟执行条件，再回一条“已成交”回报。
+
+#### 3.5.1 Banzai → Executor → Banzai 的通信流程
+
+```text
+Banzai / Initiator                                      Executor / Acceptor
+──────────────────                                      ────────────────────
+
+① 用户提交本地 Order
+   open=100, executed=0, avgPx=0, isNew=true
+      │
+      ▼
+   BanzaiApplication.send(order)
+      │ 根据 BeginString 选择 send42(order)
+      ▼
+   quickfix.fix42.NewOrderSingle(35=D)
+   11=ClOrdID, 55=Symbol, 54=Side, 38=OrderQty,
+   40=OrdType, 44=Price（限价单时）
+      │
+      ▼
+   Session.sendToTarget(message, FIX.4.2:BANZAI->EXEC)
+      │
+      │──────────── NewOrderSingle(35=D) ──────────────►
+      │                                                   │
+      │                                              Session.next(...)
+      │                                                   ▼
+      │                                              Application.fromApp(...)
+      │                                                   ▼
+      │                                              MessageCracker.crack(...)
+      │                                                   ▼
+      │                                              onMessage(fix42.NewOrderSingle,...)
+      │                                                   │
+      │                                              validateOrder(...)
+      │                                              getPrice(order)
+      │                                                   │
+      │                                              ② 创建接单回报
+      │                                              ExecutionReport(35=8)
+      │                                              17=ExecID
+      │                                              150=0  ExecType=New
+      │                                              39=0   OrdStatus=New
+      │                                              11=原 ClOrdID
+      │                                                   │
+      │◄──────── ExecutionReport(35=8, New) ───────────│
+      │
+③ BanzaiApplication.fromApp(message, sessionID)
+      │
+      ▼
+SwingUtilities.invokeLater(MessageProcessor)
+      │
+      ▼
+MessageProcessor.run()：识别 35=8
+      │
+      ▼
+executionReport(message, sessionID)
+      │
+      ├─ 用 SessionID + ExecID(17) 做去重
+      ├─ 用 ClOrdID(11) 找到 Banzai 本地 Order
+      ├─ 读取 OrdStatus(39)、CumQty(14)、AvgPx(6)、成交字段
+      └─ 更新 OrderTableModel，通知 Swing UI
+
+④ Executor 判断 isOrderExecutable(order, price)
+      │
+      ├─ 否：流程停在 New，等待后续业务处理
+      │
+      └─ 是
+          │
+          ▼
+       创建成交回报
+       ExecutionReport(35=8)
+       17=新的 ExecID
+       150=2  ExecType=Fill
+       39=2   OrdStatus=Filled
+       32=LastShares=本次成交量
+       31=LastPx=成交价
+       14=CumQty=累计成交量
+       6=AvgPx=平均成交价
+       151=LeavesQty=0
+          │
+      ◄─── ExecutionReport(35=8, Filled) ─────────────│
+      │
+⑤ Banzai 再次进入 executionReport(...)
+      │
+      ├─ 新 ExecID，故不是重复回报
+      ├─ fillSize = LastShares(32)
+      ├─ open      = open - fillSize
+      ├─ executed  = CumQty(14)
+      ├─ avgPx     = AvgPx(6)
+      ├─ 增加 Execution：symbol、quantity、lastPx、side
+      └─ 更新 OrderTableModel / ExecutionTableModel / UI
+```
+
+#### 3.5.2 标准语义下，本地订单状态如何变化
+
+以买入 `AAPL 100 @ 123.45`，且 Executor 决定立即完全成交为例：
+
+| 阶段 | 对应 FIX 消息与关键字段 | Banzai 本地 `Order` 的目标状态 |
+|---|---|---|
+| 创建 | 本地 `Order` | `open=100`、`executed=0`、`avgPx=0`、`isNew=true` |
+| 已接收 | `35=8`、`150=0(New)`、`39=0(New)`、`14=0`、`151=100` | `isNew=false`；未成交，因此 `open=100`、`executed=0` |
+| 完全成交 | `35=8`、`150=2(Fill)`、`39=2(Filled)`、`32=100`、`31=123.45`、`14=100`、`6=123.45`、`151=0` | `open=0`、`executed=100`、`avgPx=123.45`；新增一条成交记录 |
+
+部分成交时，状态应按每条执行回报逐步推进：
+
+```text
+New
+  │  150=0, 39=0, CumQty=0,   LeavesQty=订单总量
+  ▼
+Partially Filled
+  │  150=1 / Trade, 39=1, CumQty=部分成交量, LeavesQty=剩余量
+  ▼
+Filled
+     150=2 / Trade, 39=2, CumQty=订单总量, LeavesQty=0
+```
+
+每次新的执行事件都必须使用新的 `ExecID(17)`。Banzai 用 `SessionID + ExecID` 记忆已经处理的回报；这是防止 Session 重传或重复投递造成重复记账、重复更新订单状态的重要业务级幂等保护。
+
+#### 3.5.3 当前示例代码的字段一致性问题
+
+当前 `Executor` 的 FIX 4.2 `New` 回报在 [`executor/Application.java:274-279`](quickfixj-examples/executor/src/main/java/quickfix/examples/executor/Application.java:274) 中构造为：
+
+```text
+OrdStatus=New
+CumQty=0
+LeavesQty=0
+```
+
+但按标准订单语义，尚未成交的新订单应满足：
+
+```text
+CumQty=0
+LeavesQty=OrderQty
+```
+
+这不是一个无关紧要的展示细节。Banzai 的 [`executionReport(...)`](quickfixj-examples/banzai/src/main/java/quickfix/examples/banzai/BanzaiApplication.java:241) 在缺少 `LastShares(32)` 时，会按下面的公式推导本次成交量：
+
+```text
+fillSize = OrderQty - LeavesQty
+```
+
+所以，按**当前示例的实际代码**，若 Banzai 收到上述 `LeavesQty=0` 的 `New` 回报，会错误地推导出整笔订单已经成交，导致本地 `open` 被提前减为 0；随后再收到 Filled 回报，可能再次扣减成交量。这是 Banzai 与 Executor 示例组合中的订单状态字段不一致问题。
+
+学习时应分别记住：
+
+```text
+消息链路是正确的：
+NewOrderSingle -> New ExecutionReport -> Filled ExecutionReport。
+
+字段状态模型需要修正后才可作为生产参考：
+New 时 LeavesQty=订单剩余量；
+Partial / Fill 时 CumQty、LeavesQty、LastQty / LastShares、AvgPx、OrdStatus 与 ExecType 必须彼此一致。
+```
+
+#### 3.5.4 关键源码职责
+
+```text
+Banzai 发单
+BanzaiApplication.send(...)
+  -> send42(order)
+  -> quickfix.fix42.NewOrderSingle
+  -> Session.sendToTarget(...)
+
+Executor 接单与回报
+executor/Application.onMessage(fix42.NewOrderSingle, sessionID)
+  -> validateOrder(...)
+  -> 创建 New 的 ExecutionReport
+  -> sendMessage(sessionID, accept)
+  -> isOrderExecutable(...)
+  -> 若可执行，创建 Filled 的 ExecutionReport
+  -> sendMessage(sessionID, executionReport)
+
+Banzai 更新订单与成交
+BanzaiApplication.fromApp(...)
+  -> Swing EDT 的 MessageProcessor.run()
+  -> executionReport(message, sessionID)
+  -> OrderTableModel.updateOrder(...)
+  -> ExecutionTableModel.addExecution(...)
+```
+
+### 3.6 对外介绍时的关键结论
 
 > 一笔订单的业务含义由 OMS、EMS、风控、撮合等业务系统决定；QuickFIX/J 负责把该业务意图可靠地表达为 FIX 消息，并在对手方之间安全、正确地传递。订单状态管理还必须明确 `ClOrdID`、`OrderID` 和 `ExecID` 的生成方、关联方式与生命周期。
 
@@ -669,9 +857,281 @@ AAPL
 
 > 理解 Group，是从“会读取普通 FIX 字段”进入“能处理真实复杂 FIX 消息”的关键一步。
 
-### 4.11 对外介绍时的关键结论
+### 4.11 新增自定义字段：以 `InvestmentDecisionID(9001)` 为例
 
-> `FieldMap.fields` 保存普通字段，`FieldMap.groups` 保存重复结构；`Message` 负责组织完整消息，`DataDictionary` 定义 Group 的起始字段、成员字段、顺序和校验规则。在行情场景中，一个 Group 表示一条 Bid、Ask 或深度行情记录，多个 Group 共同构成一个 Symbol 的行情集合。
+当标准 FIX 字段不足以表达双方的业务需求时，可以在双方协商的 **Rules of Engagement（对接规则）**中增加用户自定义字段。以下示例在订单中携带买方的“投资决策编号”，用于关联策略信号、委托、执行回报与审计记录：
+
+```text
+字段名：InvestmentDecisionID
+Tag：9001（用户自定义字段通常使用 >= 5000 的 Tag）
+类型：STRING
+
+发送：NewOrderSingle(35=D)
+回传：ExecutionReport(35=8)
+示例值：ALPHA-AAPL-20260823-001
+```
+
+#### 4.11.1 最小实现的文件清单
+
+```text
+新增文件：2 个
+├─ quickfixj-examples/banzai/src/main/resources/
+│  quickfix/examples/banzai/FIX42_BUYSIDE.xml
+└─ quickfixj-examples/executor/src/main/resources/
+   quickfix/examples/executor/FIX42_BUYSIDE.xml
+
+修改文件：4 个
+├─ banzai/BanzaiApplication.java
+├─ executor/Application.java
+├─ Banzai 使用的 cfg
+└─ Executor 使用的 cfg
+```
+
+两份 `FIX42_BUYSIDE.xml` 应从标准 `FIX42.xml` 复制而来，并保持内容一致。不要长期直接修改仓库内的标准字典。
+
+#### 4.11.2 在自定义字典中增加什么
+
+**第一处：在 `<fields>` 中定义 Tag、名称和类型：**
+
+```xml
+<field number="9001" name="InvestmentDecisionID" type="STRING"/>
+```
+
+**第二处：在 `NewOrderSingle(35=D)` 中声明该字段可用：**
+
+```xml
+<message name="NewOrderSingle" msgtype="D" msgcat="app">
+    <!-- 原有标准字段保持不变 -->
+    <field name="InvestmentDecisionID" required="N"/>
+</message>
+```
+
+**第三处：在 `ExecutionReport(35=8)` 中声明可回传该字段：**
+
+```xml
+<message name="ExecutionReport" msgtype="8" msgcat="app">
+    <!-- 原有标准字段保持不变 -->
+    <field name="InvestmentDecisionID" required="N"/>
+</message>
+```
+
+```text
+<fields> 中的定义：说明“9001 是什么、值是什么类型”。
+
+<message> 中的引用：说明“9001 可以出现在哪类 FIX 消息中”。
+```
+
+这里使用 `required="N"`，表示对接初期允许旧订单或手工订单不带该字段。只有当双方明确所有相关消息都必须携带该字段时，才应改为 `required="Y"`。
+
+#### 4.11.3 在两端配置中加载相同字典
+
+在 Banzai 与 Executor 各自实际使用的 Session 配置中，将：
+
+```ini
+DataDictionary=FIX42.xml
+```
+
+改为：
+
+```ini
+DataDictionary=FIX42_BUYSIDE.xml
+```
+
+```text
+Banzai 认识 9001、Executor 不认识 9001
+  -> Executor 可能因字典校验拒绝订单。
+
+Executor 回传 9001、Banzai 不认识 9001
+  -> Banzai 可能因字典校验拒绝回报。
+```
+
+因此，**自定义字段的字典必须作为双方共同版本化的协议契约**。
+
+#### 4.11.4 Banzai 需要增加的发送与接收逻辑
+
+修改：
+
+```text
+quickfixj-examples/banzai/src/main/java/
+quickfix/examples/banzai/BanzaiApplication.java
+```
+
+在 `send42(Order order)` 创建 `NewOrderSingle` 并设置 `OrderQty` 后，增加：
+
+```java
+newOrderSingle.setString(9001, "LEARNING-ALPHA-001");
+```
+
+这会使 `NewOrderSingle(35=D)` 的 Body 中包含：
+
+```text
+9001=LEARNING-ALPHA-001
+```
+
+在 `executionReport(Message message, SessionID sessionID)` 开头增加读取逻辑：
+
+```java
+if (message.isSetField(9001)) {
+    System.out.println("ExecutionReport InvestmentDecisionID="
+            + message.getString(9001)
+            + ", session=" + sessionID
+            + ", clOrdID=" + message.getString(ClOrdID.FIELD));
+}
+```
+
+最小学习版先使用固定字符串即可；后续应在 Banzai 的领域 `Order` 中增加 `investmentDecisionID` 属性，再将：
+
+```text
+Order.investmentDecisionID
+  -> NewOrderSingle Tag 9001
+```
+
+从而实现真正的领域对象到 FIX Message 映射。
+
+#### 4.11.5 Executor 需要增加的读取和回传逻辑
+
+修改：
+
+```text
+quickfixj-examples/executor/src/main/java/
+quickfix/examples/executor/Application.java
+```
+
+在：
+
+```java
+onMessage(quickfix.fix42.NewOrderSingle order, SessionID sessionID)
+```
+
+的 `validateOrder(order)` 后，读取字段：
+
+```java
+String investmentDecisionID = null;
+if (order.isSetField(9001)) {
+    investmentDecisionID = order.getString(9001);
+    System.out.println("Received InvestmentDecisionID="
+            + investmentDecisionID + ", session=" + sessionID);
+}
+```
+
+创建 `New` 的 `ExecutionReport` 后、发送前，回传字段：
+
+```java
+if (investmentDecisionID != null) {
+    accept.setString(9001, investmentDecisionID);
+}
+```
+
+创建 `Filled` 的 `ExecutionReport` 后、发送前，同样回传：
+
+```java
+if (investmentDecisionID != null) {
+    executionReport.setString(9001, investmentDecisionID);
+}
+```
+
+#### 4.11.6 完整验证流程
+
+```text
+Banzai
+  │
+  │ NewOrderSingle(35=D)
+  │ 11=C001
+  │ 9001=LEARNING-ALPHA-001
+  ▼
+Executor
+  │
+  ├─ DataDictionary 校验：9001 已定义且允许出现在 35=D
+  ├─ 读取并打印 9001
+  ├─ 可将其用于风控、路由、审计或策略归因
+  │
+  ├─ ExecutionReport(35=8, New)
+  │  9001=LEARNING-ALPHA-001
+  │
+  └─ ExecutionReport(35=8, Filled)
+     9001=LEARNING-ALPHA-001
+  ▼
+Banzai
+  │
+  ├─ DataDictionary 校验：9001 已定义且允许出现在 35=8
+  ├─ 读取并打印 9001
+  └─ 将订单、成交和投资决策记录关联
+```
+
+#### 4.11.7 后续规范化：新增类型安全字段类
+
+最小实现使用：
+
+```java
+message.setString(9001, value);
+message.getString(9001);
+```
+
+后续可新增共享 Java 类：
+
+```text
+quickfixj-examples/custom-fix-rules/src/main/java/
+quickfix/examples/common/field/InvestmentDecisionID.java
+```
+
+```java
+package quickfix.examples.common.field;
+
+import quickfix.StringField;
+
+public class InvestmentDecisionID extends StringField {
+    public static final int FIELD = 9001;
+
+    public InvestmentDecisionID() {
+        super(FIELD);
+    }
+
+    public InvestmentDecisionID(String value) {
+        super(FIELD, value);
+    }
+}
+```
+
+Banzai 与 Executor 共用该类后，代码可改为：
+
+```java
+newOrderSingle.setField(
+        new InvestmentDecisionID("LEARNING-ALPHA-001"));
+```
+
+```text
+FIX42_BUYSIDE.xml
+  = 双方认可的协议定义与校验规则。
+
+InvestmentDecisionID.java
+  = Java 侧更清晰、类型安全的字段访问工具。
+```
+
+#### 4.11.8 不建议长期关闭校验
+
+QuickFIX/J 提供：
+
+```ini
+ValidateUserDefinedFields=N
+```
+
+它允许 Tag >= 5000 的未知字段绕过部分字典校验，适合短期排障或字典迁移期；但不应作为正式对接方案。
+
+```text
+正式方案：
+双方使用同版本自定义 DataDictionary
+  +
+ValidateUserDefinedFields=Y
+
+不推荐：
+长期关闭校验，把自定义 Tag 当作无约束字符串。
+```
+
+> 新增自定义字段不是只写一行 `setString(9001, value)`；完整流程是：业务语义定义 → 双方约定 Tag 与类型 → DataDictionary 声明字段与消息归属 → 双方加载相同字典 → 发方设置 → 收方读取并回传 → 回报、审计和幂等处理关联。
+
+### 4.12 对外介绍时的关键结论
+
+> `FieldMap.fields` 保存普通字段，`FieldMap.groups` 保存重复结构；`Message` 负责组织完整消息，`DataDictionary` 定义 Group 的起始字段、成员字段、顺序和校验规则。在行情场景中，一个 Group 表示一条 Bid、Ask 或深度行情记录，多个 Group 共同构成一个 Symbol 的行情集合。自定义字段则进一步表明：DataDictionary 不只描述标准 FIX，它也是双方共同维护的业务协议契约。
 
 ---
 
@@ -1482,7 +1942,7 @@ traderapi + TraderSpi               FIX Trading Session + ExecutionReportHandler
 第 6 部分：总结与源码、实验入口                     3～5 分钟
 ```
 
-### 6.1 每部分建议包含的内容
+### 8.1 每部分建议包含的内容
 
 | 部分 | 架构图 | 示例 | 建议源码入口 | 可演示实验 |
 |---|---|---|---|---|
