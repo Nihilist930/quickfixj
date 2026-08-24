@@ -1,6 +1,6 @@
 # QuickFIX/J 自学纲领：从业务流程到会话可靠性
 
-> **目标**：用一笔订单说明业务如何接入，用消息转换说明 FIX 协议如何落地，用会话恢复说明生产环境如何保证通信可靠。  
+> **目标**：用一笔订单说明业务如何接入，用消息转换说明 FIX 协议如何落地，用会话建立、动态会话建立及会话恢复说明生产环境如何保证通信可靠。  
 > **适用场景**：学习 QuickFIX/J、向团队介绍 FIX 接入架构、准备 30～45 分钟的技术分享。
 
 ---
@@ -1137,7 +1137,125 @@ ValidateUserDefinedFields=Y
 
 ## 5. 主线三：Session 可靠性——心跳、重连、序号与重传
 
-### 5.1 为什么不只讲“断线重连”
+### 5.1 Logon：FIX 会话建立的起点
+
+在理解重连、序号恢复和消息重传之前，应该先理解 Logon，因为整个 FIX Session 的正式建立都从 `35=A` 开始。
+
+```text
+Initiator
+  -> Session.next()
+  -> generateLogon()
+  -> initializeHeader(...)
+  -> 生成 35=A(Logon)
+  -> 写入 34=MsgSeqNum、49/56、98、108
+  -> toAdmin(...)
+  -> 发给对端
+
+Acceptor
+  -> 收到 35=A
+  -> Session.nextLogon(...)
+  -> 检查 BeginString、Sender/Target、MsgSeqNum、会话状态
+  -> fromAdmin(...)
+  -> 校验通过
+  -> 回一个 35=A(Logon)
+  -> onLogon(sessionID)
+
+Initiator
+  -> 收到对端 35=A
+  -> nextLogon(...)
+  -> 校验通过
+  -> onLogon(sessionID)
+  -> 会话正式进入 logged-on 状态
+```
+
+三个回调的职责可以压缩为：
+
+```text
+toAdmin
+  = 发出 Logon 前最后一次修改管理消息的机会
+
+fromAdmin
+  = 收到 Logon 后做认证和校验的入口
+
+onLogon
+  = 双方确认登录成功后的回调
+```
+
+### 5.2 如果 Logon 需要传用户名和密码
+
+最常见的做法是：
+
+```text
+客户端在 toAdmin(...) 里往 35=A 塞用户名和密码
+服务端在 fromAdmin(...) 里读取并校验
+校验失败则 RejectLogon
+校验通过才进入 onLogon(...)
+```
+
+流程图：
+
+```text
+客户端
+  -> generateLogon()
+  -> toAdmin(message, sessionID)
+       -> if 35=A
+            set Username(553)
+            set Password(554)
+  -> 发出 Logon
+
+服务端
+  -> 收到 Logon
+  -> fromAdmin(message, sessionID)
+       -> if 35=A
+            读取 Username / Password
+            做认证校验
+            失败 -> RejectLogon
+            成功 -> 继续
+  -> nextLogon(...)
+  -> 回 Logon
+  -> onLogon(sessionID)
+```
+
+最小示例：
+
+```java
+@Override
+public void toAdmin(Message message, SessionID sessionID) {
+    try {
+        String msgType = message.getHeader().getString(MsgType.FIELD);
+        if (MsgType.LOGON.equals(msgType)) {
+            message.setField(new Username("demo_user"));
+            message.setField(new Password("demo_pass"));
+        }
+    } catch (FieldNotFound e) {
+        throw new RuntimeException(e);
+    }
+}
+
+@Override
+public void fromAdmin(Message message, SessionID sessionID)
+        throws FieldNotFound, IncorrectDataFormat, IncorrectTagValue, RejectLogon {
+    String msgType = message.getHeader().getString(MsgType.FIELD);
+    if (MsgType.LOGON.equals(msgType)) {
+        String username = message.getString(Username.FIELD);
+        String password = message.getString(Password.FIELD);
+
+        if (!"demo_user".equals(username) || !"demo_pass".equals(password)) {
+            throw new RejectLogon("invalid username or password");
+        }
+    }
+}
+```
+
+对应 Logon 报文可以理解为：
+
+```text
+8=FIX.4.4|9=...|35=A|34=1|49=CLIENT|56=SERVER|98=0|108=30|553=demo_user|554=demo_pass|10=...
+```
+
+注意：在 `FIX.4.2` 场景下，`Username(553)`、`Password(554)` 常常也会被使用，但是否能通过严格校验，取决于双方约定和 DataDictionary 配置。
+
+### 5.3 为什么不只讲“断线重连”
 
 仅有 Socket 重连不足以保证 FIX 会话正确：
 
@@ -1159,7 +1277,7 @@ FIX Session 的关键问题是：
 Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 ```
 
-### 5.2 正常会话中的可靠性机制
+### 5.4 正常会话中的可靠性机制
 
 ```text
 每个逻辑 Session
@@ -1169,7 +1287,7 @@ Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 └─ TestRequest(35=1) 探测疑似失联的对端
 ```
 
-### 5.3 断线恢复流程
+### 5.5 断线恢复流程
 
 ```text
 网络连接中断
@@ -1217,7 +1335,7 @@ Initiator 按 ReconnectInterval 重连
           双方序号重新一致，Session 恢复
 ```
 
-### 5.4 关键概念表
+### 5.6 关键概念表
 
 | 概念 | 含义 | 要解决的问题 |
 |---|---|---|
@@ -1231,7 +1349,7 @@ Initiator 按 ReconnectInterval 重连
 | `SequenceReset(35=4)` | 序号重置或 Gap Fill | 不逐条重发时如何推进序号？ |
 | `ResetSeqNumFlag(141)` | Logon 时重置序号标志 | 在双方明确同意时如何从头开始？ |
 
-### 5.5 应用层仍需具备幂等能力
+### 5.7 应用层仍需具备幂等能力
 
 即使 FIX 有序号和 `PossDupFlag(43)`，业务系统也不能假设“同一业务结果绝不会再次出现”。
 
@@ -1245,7 +1363,7 @@ Initiator 按 ReconnectInterval 重连
 识别重复请求、重复执行回报或重发消息，避免重复记账、重复成交、重复更新状态。
 ```
 
-### 5.6 Session 可靠性与系统级高可用的边界
+### 5.8 Session 可靠性与系统级高可用的边界
 
 ```text
 QuickFIX/J 可以提供：
@@ -1283,7 +1401,7 @@ QuickFIX/J 的 Session 可靠性
 业务幂等与重复回报处理
 ```
 
-### 5.7 对外介绍时的关键结论
+### 5.9 对外介绍时的关键结论
 
 > QuickFIX/J 不只是“把消息发到 Socket 上”。它通过 Session、序号、Store、心跳和重传机制，使断线后的通信可以恢复到双方可验证的一致状态。
 
