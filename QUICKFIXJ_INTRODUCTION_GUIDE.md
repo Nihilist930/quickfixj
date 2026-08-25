@@ -1181,7 +1181,88 @@ onLogon
   = 双方确认登录成功后的回调
 ```
 
-### 5.2 如果 Logon 需要传用户名和密码
+### 5.2 Heartbeat：空闲时的会话保活机制
+
+Heartbeat(35=0) 不能简单理解成“每隔 `HeartBtInt` 秒，对方向本方发一条心跳”。更准确的理解是：
+
+```text
+在一个 FIX Session 中，双方都会根据 HeartBtInt 维护各自的会话活性。
+如果某一方向在 HeartBtInt 时间内没有发送任何消息，
+就会发送 35=0 Heartbeat，表示该方向仍然存活。
+```
+
+所以，`HeartBtInt` 的本质不是“强制固定周期发心跳”，而是：
+
+```text
+空闲情况下的保活间隔
+```
+
+### 5.3 心跳不是只看对方发不发 35=0
+
+FIX 的活性判断不是只靠单向心跳，而是双向维护：
+
+```text
+Banzai -> Executor
+  这一方向维护自己的发送活性
+
+Executor -> Banzai
+  这一方向也维护自己的发送活性
+```
+
+因此：
+
+```text
+如果这段时间已经发送了其他正常消息
+比如：
+- 35=D NewOrderSingle
+- 35=8 ExecutionReport
+- 35=A Logon
+- 35=5 Logout
+
+那么这些消息本身就已经证明链路活着，
+通常不一定还要额外发送 35=0。
+```
+
+一句话说就是：
+
+```text
+Heartbeat 是“空闲时保活”，不是“无论是否有业务流量都机械定时发包”。
+```
+
+### 5.4 Heartbeat、TestRequest 与失联检测
+
+可以把正常会话中的保活逻辑理解成下面这个流程：
+
+```text
+正常有业务流量
+  -> 不一定需要额外 Heartbeat
+
+长时间空闲
+  -> 发送 35=0 Heartbeat 保活
+
+长时间没收到对方任何消息
+  -> 发送 35=1 TestRequest 探活
+
+对方收到 TestRequest
+  -> 应回 35=0 Heartbeat
+
+仍然没有响应
+  -> 判定连接异常，后续断开并重连
+```
+
+这里最容易混淆的点是：
+
+```text
+35=0 Heartbeat
+  = 空闲保活
+
+35=1 TestRequest
+  = 主动探测对方是否还活着
+```
+
+所以，Heartbeat 和 TestRequest 不是一回事，二者是配合关系。
+
+### 5.5 如果 Logon 需要传用户名和密码
 
 最常见的做法是：
 
@@ -1255,7 +1336,7 @@ public void fromAdmin(Message message, SessionID sessionID)
 
 注意：在 `FIX.4.2` 场景下，`Username(553)`、`Password(554)` 常常也会被使用，但是否能通过严格校验，取决于双方约定和 DataDictionary 配置。
 
-### 5.3 为什么不只讲“断线重连”
+### 5.6 为什么不只讲“断线重连”
 
 仅有 Socket 重连不足以保证 FIX 会话正确：
 
@@ -1277,7 +1358,7 @@ FIX Session 的关键问题是：
 Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 ```
 
-### 5.4 正常会话中的可靠性机制
+### 5.7 正常会话中的可靠性机制
 
 ```text
 每个逻辑 Session
@@ -1287,7 +1368,7 @@ Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 └─ TestRequest(35=1) 探测疑似失联的对端
 ```
 
-### 5.5 断线恢复流程
+### 5.8 断线恢复流程
 
 ```text
 网络连接中断
@@ -1335,7 +1416,7 @@ Initiator 按 ReconnectInterval 重连
           双方序号重新一致，Session 恢复
 ```
 
-### 5.6 关键概念表
+### 5.9 关键概念表
 
 | 概念 | 含义 | 要解决的问题 |
 |---|---|---|
@@ -1349,7 +1430,7 @@ Initiator 按 ReconnectInterval 重连
 | `SequenceReset(35=4)` | 序号重置或 Gap Fill | 不逐条重发时如何推进序号？ |
 | `ResetSeqNumFlag(141)` | Logon 时重置序号标志 | 在双方明确同意时如何从头开始？ |
 
-### 5.7 应用层仍需具备幂等能力
+### 5.10 应用层仍需具备幂等能力
 
 即使 FIX 有序号和 `PossDupFlag(43)`，业务系统也不能假设“同一业务结果绝不会再次出现”。
 
@@ -1363,7 +1444,7 @@ Initiator 按 ReconnectInterval 重连
 识别重复请求、重复执行回报或重发消息，避免重复记账、重复成交、重复更新状态。
 ```
 
-### 5.8 Session 可靠性与系统级高可用的边界
+### 5.11 Session 可靠性与系统级高可用的边界
 
 ```text
 QuickFIX/J 可以提供：
@@ -1401,7 +1482,7 @@ QuickFIX/J 的 Session 可靠性
 业务幂等与重复回报处理
 ```
 
-### 5.9 对外介绍时的关键结论
+### 5.12 对外介绍时的关键结论
 
 > QuickFIX/J 不只是“把消息发到 Socket 上”。它通过 Session、序号、Store、心跳和重传机制，使断线后的通信可以恢复到双方可验证的一致状态。
 
