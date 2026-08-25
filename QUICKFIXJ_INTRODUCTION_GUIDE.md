@@ -1336,7 +1336,147 @@ public void fromAdmin(Message message, SessionID sessionID)
 
 注意：在 `FIX.4.2` 场景下，`Username(553)`、`Password(554)` 常常也会被使用，但是否能通过严格校验，取决于双方约定和 DataDictionary 配置。
 
-### 5.6 为什么不只讲“断线重连”
+### 5.6 Acceptor 动态 Session：Executor 如何按 Logon 创建不同会话
+
+`Executor` 的动态 Session 机制适用于卖方网关、券商或交易所：服务端启动时不必预先为每个买方创建固定 Session；某个买方首次连接并发送 `Logon(35=A)` 后，Executor 才按模板创建该买方对应的真实 Session。
+
+```text
+模板 = 未来某类客户应使用的配置
+动态 Session = 某个真实客户首次 Logon 后实际创建的 Session 对象
+```
+
+#### 5.6.1 模板配置：按 FIX 版本定义规则
+
+`executor_dynamic.cfg` 为每个版本定义一个 `AcceptorTemplate=Y` 的模板：
+
+```ini
+[default]
+ConnectionType=acceptor
+SocketAcceptPort=9876
+SenderCompID=*
+TargetCompID=*
+
+[session]
+AcceptorTemplate=Y
+BeginString=FIX.4.2
+DataDictionary=FIX42.xml
+
+[session]
+AcceptorTemplate=Y
+BeginString=FIX.4.4
+DataDictionary=FIX44.xml
+```
+
+含义：
+
+```text
+收到 FIX.4.2 客户的 Logon -> 使用 FIX42.xml 创建会话
+收到 FIX.4.4 客户的 Logon -> 使用 FIX44.xml 创建会话
+```
+
+当前示例的 `SenderCompID=*`、`TargetCompID=*` 表示接受任意 CompID，仅适合学习。生产中必须结合明确的 CompID 规则、来源 IP 白名单、认证和 TLS 等限制接入方。
+
+#### 5.6.2 `configureDynamicSessions(...)` 启动时只注册“建会话工厂”
+
+源码：`quickfixj-examples/executor/src/main/java/quickfix/examples/executor/Executor.java`。
+
+```text
+Executor 启动
+  │
+  ▼
+遍历 SessionSettings 中全部 [session]
+  │
+  ▼
+筛选 AcceptorTemplate=Y 的模板
+  │
+  ▼
+按 SocketAcceptAddress + SocketAcceptPort 分组 TemplateMapping
+  │
+  ▼
+为每个监听地址注册 DynamicAcceptorSessionProvider
+  │
+  ▼
+SocketAcceptor 开始监听
+```
+
+`TemplateMapping(sessionID, sessionID)` 的两个参数在当前示例中看起来相同，但语义不同：
+
+```text
+pattern    = 哪些真实 SessionID 可以匹配模板
+templateID = 匹配成功后应复制哪段 Session 配置
+```
+
+因此，`configureDynamicSessions(...)` 本身**不会创建 FUND_A、BANZAI 等真实客户 Session**；它只为端口安装后续动态创建 Session 的 Provider。
+
+#### 5.6.3 首次 Logon 时的动态创建流程
+
+```text
+买方 FUND_A 连接 Executor:9876
+  │
+  │ Logon(35=A)
+  │ 8=FIX.4.2, 49=FUND_A, 56=EXEC
+  ▼
+AcceptorIoHandler
+  │
+  │ 按 Acceptor 本地视角反转身份
+  ▼
+真实 SessionID：FIX.4.2:EXEC->FUND_A
+  │
+  ▼
+DynamicAcceptorSessionProvider.getSession(sessionID)
+  │
+  ├─ 已存在该 Session
+  │    └─ 直接复用已有的 Session、Store 和序号状态
+  │
+  └─ 不存在
+       │
+       ▼
+     匹配模板：FIX.4.2:*->*
+       │
+       ▼
+     复制 [default] + FIX.4.2 模板配置
+       │
+       ├─ DataDictionary=FIX42.xml
+       ├─ HeartBtInt、FileStorePath、日志等通用参数
+       └─ Application、MessageStoreFactory、MessageFactory
+       │
+       ▼
+     用 Logon 中真实身份覆盖 BeginString / SenderCompID / TargetCompID
+       │
+       ▼
+     DefaultSessionFactory.create(...)
+       │
+       ▼
+     sessionConnector.addDynamicSession(session)
+       │
+       ▼
+     将 Session 绑定当前 TCP 连接并继续完成 Logon
+```
+
+同一端口因此可同时维护多个独立 Session：
+
+```text
+FIX.4.2:EXEC->FUND_A  -> FIX42.xml、独立 MsgSeqNum、独立 Store
+FIX.4.4:EXEC->FUND_B  -> FIX44.xml、独立 MsgSeqNum、独立 Store
+FIX.4.1:EXEC->FUND_C  -> FIX41.xml、独立 MsgSeqNum、独立 Store
+```
+
+#### 5.6.4 与多 Session 和高并发的关系
+
+```text
+动态 Session
+  = 按需管理大量潜在接入方的生命周期。
+
+多 Session
+  = 多个真实会话之间的连接、序号、心跳、Store 和恢复状态彼此隔离。
+
+高并发
+  = 多条 Session 可并行通信；同一条 Session 内仍必须严格保持消息顺序。
+```
+
+> Dynamic Acceptor Session 解决“未知或大量客户如何按需接入”；它不是单条 Session 的吞吐优化，也不等同于系统级高可用。
+
+### 5.7 为什么不只讲“断线重连”
 
 仅有 Socket 重连不足以保证 FIX 会话正确：
 
@@ -1358,7 +1498,7 @@ FIX Session 的关键问题是：
 Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 ```
 
-### 5.7 正常会话中的可靠性机制
+### 5.8 正常会话中的可靠性机制
 
 ```text
 每个逻辑 Session
@@ -1368,7 +1508,7 @@ Session 可靠性：心跳、断线、重连、序号恢复与消息重传
 └─ TestRequest(35=1) 探测疑似失联的对端
 ```
 
-### 5.8 断线恢复流程
+### 5.9 断线恢复流程
 
 ```text
 网络连接中断
@@ -1416,7 +1556,7 @@ Initiator 按 ReconnectInterval 重连
           双方序号重新一致，Session 恢复
 ```
 
-### 5.9 关键概念表
+### 5.10 关键概念表
 
 | 概念 | 含义 | 要解决的问题 |
 |---|---|---|
@@ -1430,7 +1570,7 @@ Initiator 按 ReconnectInterval 重连
 | `SequenceReset(35=4)` | 序号重置或 Gap Fill | 不逐条重发时如何推进序号？ |
 | `ResetSeqNumFlag(141)` | Logon 时重置序号标志 | 在双方明确同意时如何从头开始？ |
 
-### 5.10 应用层仍需具备幂等能力
+### 5.11 应用层仍需具备幂等能力
 
 即使 FIX 有序号和 `PossDupFlag(43)`，业务系统也不能假设“同一业务结果绝不会再次出现”。
 
@@ -1444,7 +1584,7 @@ Initiator 按 ReconnectInterval 重连
 识别重复请求、重复执行回报或重发消息，避免重复记账、重复成交、重复更新状态。
 ```
 
-### 5.11 Session 可靠性与系统级高可用的边界
+### 5.12 Session 可靠性与系统级高可用的边界
 
 ```text
 QuickFIX/J 可以提供：
@@ -1482,7 +1622,7 @@ QuickFIX/J 的 Session 可靠性
 业务幂等与重复回报处理
 ```
 
-### 5.12 对外介绍时的关键结论
+### 5.13 对外介绍时的关键结论
 
 > QuickFIX/J 不只是“把消息发到 Socket 上”。它通过 Session、序号、Store、心跳和重传机制，使断线后的通信可以恢复到双方可验证的一致状态。
 
