@@ -510,6 +510,10 @@ BanzaiApplication.fromApp(...)
 
 > 一笔订单的业务含义由 OMS、EMS、风控、撮合等业务系统决定；QuickFIX/J 负责把该业务意图可靠地表达为 FIX 消息，并在对手方之间安全、正确地传递。订单状态管理还必须明确 `ClOrdID`、`OrderID` 和 `ExecID` 的生成方、关联方式与生命周期。
 
+### 3.7 图片总结
+
+![NewOrderSingle.png](img/quickfix_NewOrderSingle.png)
+
 ---
 
 ## 4. 主线二：领域对象、FIX Message 与原始 FIX 报文的转换
@@ -1133,9 +1137,205 @@ ValidateUserDefinedFields=Y
 
 > `FieldMap.fields` 保存普通字段，`FieldMap.groups` 保存重复结构；`Message` 负责组织完整消息，`DataDictionary` 定义 Group 的起始字段、成员字段、顺序和校验规则。在行情场景中，一个 Group 表示一条 Bid、Ask 或深度行情记录，多个 Group 共同构成一个 Symbol 的行情集合。自定义字段则进一步表明：DataDictionary 不只描述标准 FIX，它也是双方共同维护的业务协议契约。
 
+![quickfix_MessageParse.png](img/quickfix_MessageParse.png)
 ---
 
 ## 5. 主线三：Session 可靠性——心跳、重连、序号与重传
+
+### Session.java 的整体架构：四条主线
+
+`Session.java` 不是简单的 TCP 连接类，而是 QuickFIX/J 中围绕 FIX 会话生命周期运行的核心状态机。它把网络连接、FIX 协议校验、消息分发、序号管理、心跳和断线恢复组织在一起。
+
+```text
+网络层
+  └─ Connector / Apache MINA
+       │ Message
+       ▼
+Session
+  ├─ 入站消息处理
+  ├─ 出站消息发送
+  ├─ 定时器驱动
+  └─ 断线恢复与消息重传
+       │
+       ├─ Application：业务回调
+       ├─ SessionState：会话运行状态
+       ├─ MessageStore：序号与历史消息
+       ├─ MessageQueue：乱序消息暂存
+       ├─ Responder：当前物理连接的发送出口
+       └─ SessionSchedule：会话时间窗口
+```
+
+```text
+Session
+  = FIX 逻辑会话
+  ≠ 一次 TCP 连接
+```
+
+同一个 `SessionID` 可以经历多次 TCP 连接；连接断开时，当前 `Responder` 会被清理，但 Session 的序号、Store 和恢复状态可以继续保留。
+
+#### 1. 入站消息处理线
+
+```text
+TCP / Apache MINA
+  -> Connector 将字节解析为 Message
+  -> Session.next(Message)
+  -> 检查 MsgSeqNum、BeginString、CompID、时间和字典
+  -> verify(...)
+  -> 按 MsgType 分流
+```
+
+管理消息由 `Session` 自己处理：
+
+```text
+Logon            -> nextLogon(...)
+Heartbeat        -> nextHeartBeat(...)
+TestRequest      -> nextTestRequest(...)
+ResendRequest    -> nextResendRequest(...)
+SequenceReset    -> nextSequenceReset(...)
+Logout           -> nextLogout(...)
+```
+
+普通业务消息则进入 Application：
+
+```text
+Session.next(Message)
+  -> verify(...)
+  -> Application.fromApp(...) / fromAdmin(...)
+  -> MessageCracker.crack(...)
+  -> onMessage(...)
+```
+
+核心原则：
+
+```text
+Session 先判断“消息是否符合会话规则”；
+Application 再判断“业务消息应该如何处理”。
+```
+
+#### 2. 出站消息发送线
+
+```text
+业务代码创建 Message
+  -> Session.sendToTarget(...)
+  -> Session.send(...)
+  -> sendRaw(...)
+  -> initializeHeader(...)
+  -> Application.toApp(...) / toAdmin(...)
+  -> MessageStore 持久化
+  -> Responder.send(...)
+```
+
+`Session` 会自动补充或覆盖会话字段：
+
+```text
+BeginString(8)
+SenderCompID(49)
+TargetCompID(56)
+MsgSeqNum(34)
+SendingTime(52)
+```
+
+因此业务层通常不应自行维护 `MsgSeqNum(34)`。消息发送成功通常只表示消息已经排入异步网络发送队列，不代表对方已经完成业务接收；订单最终状态仍应以对方的 `ExecutionReport` 为准。
+
+#### 3. 定时器驱动线
+
+```text
+定时器调用 Session.next()
+  ├─ 检查 Session 时间窗口
+  ├─ 发起或检查 Logon
+  ├─ 检查 Logout 超时
+  ├─ 检查 Heartbeat 超时
+  ├─ 发送 TestRequest
+  └─ 发送 Heartbeat
+```
+
+```text
+本方在 HeartBtInt 内没有发送任何消息
+  -> generateHeartbeat()
+  -> Heartbeat(35=0)
+
+本方长时间没有收到对方任何消息
+  -> generateTestRequest()
+  -> TestRequest(35=1)
+
+对方连 TestRequest 都没有响应
+  -> disconnect(...)
+```
+
+这里的两个 `next` 入口要区分：
+
+```text
+next(Message)
+  = 收到 FIX 消息后处理
+
+next()
+  = 定时器触发后主动维护 Session
+```
+
+#### 4. 断线恢复与消息重传线
+
+```text
+网络断开
+  -> Connector / Initiator 重建 TCP 连接
+  -> Session 重新发送或接收 Logon(35=A)
+  -> 比较双方 MsgSeqNum(34)
+  -> 发现序号缺口
+  -> ResendRequest(35=2)
+  -> MessageStore 重放历史消息
+       或
+     SequenceReset(35=4) / Gap Fill
+  -> 处理暂存消息
+  -> Session 恢复
+```
+
+当本方期望收到 `34=52`，却先收到 `34=55` 时：
+
+```text
+收到 55
+  -> 判断序号过高
+  -> 将 55 放入 MessageQueue
+  -> 请求补发 52~54
+  -> 处理重传消息
+  -> 再处理队列中的 55
+```
+
+历史消息重发时通常带有：
+
+```text
+PossDupFlag(43)=Y
+OrigSendingTime(122)=原始发送时间
+```
+
+表示这是一条历史消息的重发，而不是新的业务请求。
+
+#### 四条主线如何共同完成一笔订单
+
+```text
+业务创建 NewOrderSingle
+  -> 出站线：补 Header、分配序号、持久化并发送
+  -> 入站线：对手方接收、校验并进入 onMessage
+  -> 对手方返回 ExecutionReport
+  -> 定时线：空闲时维护 Logon、Heartbeat 和 TestRequest
+  -> 若网络断开，恢复线重新 Logon、比较序号并重传
+```
+
+#### 四条主线对应的源码入口
+
+| 主线 | 关键方法 | 主要职责 |
+|---|---|---|
+| 入站消息 | `next(Message)`、`verify(...)`、`fromCallback(...)` | 接收、校验和分发 |
+| 出站消息 | `send(...)`、`sendRaw(...)`、`persist(...)` | 补 Header、分配序号、持久化和发送 |
+| 定时器 | `next()`、`generateLogon()`、`generateHeartbeat()`、`generateTestRequest()` | 登录、心跳、探活和超时 |
+| 恢复重传 | `nextLogon(...)`、`nextResendRequest(...)`、`manageGapFill(...)`、`resendMessages(...)` | 重连、补缺、重放和 Gap Fill |
+
+建议阅读源码时始终围绕四个问题：
+
+```text
+消息能否进入？
+消息如何发出？
+没有业务消息时 Session 如何运行？
+连接或序号出错后如何恢复？
+```
 
 ### 5.1 Logon：FIX 会话建立的起点
 
@@ -1555,6 +1755,8 @@ Initiator 按 ReconnectInterval 重连
             ▼
           双方序号重新一致，Session 恢复
 ```
+
+![quickfix_MessageRestore.png](img/quickfix_MessageRestore.png)
 
 ### 5.10 关键概念表
 
