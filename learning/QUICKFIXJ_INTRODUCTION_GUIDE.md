@@ -1894,7 +1894,117 @@ ReqOrderInsert / 报单请求
   ≈ NewOrderSingle + Session.sendToTarget(...)
 ```
 
-### 6.4 共同点：两者都在做“事件驱动交易”
+### 6.4 完全成交流程对照
+
+前面的角色对应关系说明了奇点交易系统与 QuickFIX/J 学习系统中各个组件的大致位置。下面用两张完全成交流程图，把两者从报单到最终成交回报的过程放在一起对照。
+
+#### 6.4.1 奇点系统的订单完全成交流程
+
+![奇点系统订单完全成交流程](img/singularity_filled.png)
+
+图 6-1：奇点系统从报单请求到完全成交的完整回调链路。
+
+这张图的主线是：
+
+```text
+ReqOrderInsert
+  -> OnRspOrderInsert
+  -> OnRtnOrder（已接收）
+  -> OnRtnOrder（已接受）
+  -> OnRtnTrade
+  -> OnRtnOrder（AllTraded）
+```
+
+重点关注两个维度：
+
+```text
+OrderStatus
+  = 订单当前处于什么状态
+
+OrderSubmitStatus
+  = 报单或撤单请求处于什么提交阶段
+```
+
+也就是说，奇点通过 API 请求和 SPI 回调表达订单生命周期，完全成交通常由成交回调 `OnRtnTrade` 与最终的 `OnRtnOrder` 共同体现。
+
+#### 6.4.2 QuickFIX/J 的订单完全成交流程
+
+![QuickFIX/J 三方订单完全成交流程](img/quickfix_filled.png)
+
+图 6-2：基于 QuickFIX/J 角色抽象的买方、卖方和交易所三方完全成交链路。
+
+这张图的主线是：
+
+```text
+买方 Banzai
+  -> NewOrderSingle(35=D)
+  -> 卖方 Executor 接单
+  -> ExecutionReport(35=8, OrdStatus=NEW)
+  -> 卖方路由到交易所
+  -> 交易所返回成交结果
+  -> 卖方汇总成交结果
+  -> ExecutionReport(35=8, OrdStatus=FILLED)
+  -> 买方更新订单和成交
+```
+
+QuickFIX/J 图中需要重点观察：
+
+```text
+ClOrdID(11)
+  = 当前发单方生成的客户订单号
+
+OrderID(37)
+  = 当前接收方或执行场所分配的订单号
+
+ExecID(17)
+  = 每一次执行回报事件的唯一标识
+```
+
+在三方链路中，不同 Session 可以拥有不同的订单标识：
+
+```text
+买方发给卖方：ClOrdID=C001
+卖方自己的订单：OrderID=S1001
+卖方发给交易所：ClOrdID=R2001
+交易所返回：OrderID(37)=EX3001
+```
+
+卖方通过内部映射把交易所订单关联回自己的订单，再使用买方原始的 `ClOrdID=C001` 向买方发送最终成交回报。
+
+> 说明：QuickFIX/J 图展示的是买方、卖方和交易所之间的合理化三方业务链路。当前仓库中的 Executor example 会直接模拟生成 NEW/FILLED 回报，OrderMatch example 则是独立的撮合示例；两者尚未在代码中组成完整的 `Banzai → Executor → OrderMatch` 三方运行链路。
+
+#### 6.4.3 两张流程图的核心对应关系
+
+| 交易流程 | 奇点系统 | QuickFIX/J 学习系统 |
+|---|---|---|
+| 发起报单 | `ReqOrderInsert` | `NewOrderSingle(35=D)` + `Session.sendToTarget(...)` |
+| 接单/报单响应 | `OnRspOrderInsert` | `ExecutionReport(35=8, ExecType=NEW)` |
+| 委托状态回报 | `OnRtnOrder` | `ExecutionReport(35=8, OrdStatus(39))` |
+| 成交回报 | `OnRtnTrade` | `ExecutionReport(35=8, ExecType(150)=FILL/TRADE)` |
+| 完全成交状态 | `OrderStatus=AllTraded` | `OrdStatus(39)=FILLED`、`LeavesQty(151)=0` |
+| 本地订单关联 | `OrderRef`、`OrderLocalID`、`OrderSysID` | `ClOrdID(11)`、`OrderID(37)`、`ExecID(17)` |
+| 回调处理入口 | `TraderSpi` | `Application.fromApp(...)` / `MessageCracker` |
+
+两张图最重要的共同点是：
+
+```text
+发出订单请求
+  -> 收到接单或接受反馈
+  -> 收到成交事件
+  -> 更新本地订单状态
+```
+
+最重要的差异是：
+
+```text
+奇点
+  = 通过专用 API 和结构化回调表达业务状态
+
+QuickFIX/J
+  = 通过 FIX Message、Tag、Session 和 Application 回调表达业务状态
+```
+
+### 6.5 共同点：两者都在做“事件驱动交易”
 
 ```text
 行情输入
@@ -1916,7 +2026,7 @@ ReqOrderInsert / 报单请求
 5. 都必须处理断线、重连与恢复
 ```
 
-### 6.5 不同点一：协议和接口形态不同
+### 6.6 不同点一：协议和接口形态不同
 
 ```text
 奇点
@@ -1952,7 +2062,7 @@ OrderCancelRequest
 fromApp(...)
 ```
 
-### 6.6 不同点二：回调边界不同
+### 6.7 不同点二：回调边界不同
 
 奇点通常会天然拆成：
 
@@ -1990,7 +2100,7 @@ Application
 QuickFIX/J：先给你统一的 FIX 边界，业务分层由你自己决定
 ```
 
-### 6.7 不同点三：QuickFIX/J 对 Session 可靠性暴露得更清楚
+### 6.8 不同点三：QuickFIX/J 对 Session 可靠性暴露得更清楚
 
 奇点类 API 往往把连接、登录、重连细节大部分封装在 SDK 中；开发者主要感知：
 
@@ -2022,7 +2132,7 @@ ReconnectInterval
 QuickFIX/J 更强调“如何维护标准 FIX 会话并保证消息可靠传输”
 ```
 
-### 6.8 不同点四：消息模型不同
+### 6.9 不同点四：消息模型不同
 
 奇点类系统通常以结构体、请求对象和回调参数为主：
 
@@ -2051,7 +2161,7 @@ ExecutionReport
 QuickFIX/J：FIX Message / DataDictionary 驱动
 ```
 
-### 6.9 最重要的边界结论
+### 6.10 最重要的边界结论
 
 ```text
 奇点交易系统
@@ -2081,7 +2191,7 @@ QuickFIX/J
 监控与运维能力
 ```
 
-### 6.10 一句话记忆
+### 6.11 一句话记忆
 
 ```text
 奇点告诉你：如何围绕行情和交易 API 组织一个策略交易系统。

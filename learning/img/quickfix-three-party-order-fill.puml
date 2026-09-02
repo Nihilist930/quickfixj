@@ -1,0 +1,127 @@
+@startuml quickfix-three-party-order-fill
+
+' QuickFIX/J 三方订单完全成交：合理化学习架构
+' 买方与卖方的 FIX 交互为核心，交易所链路做必要简化
+
+hide footbox
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequence {
+    ArrowColor #263238
+    ActorBorderColor #263238
+    LifeLineBorderColor #90A4AE
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #263238
+    ParticipantBackgroundColor #E8F1F8
+    ParticipantFontColor #102A43
+    ActorFontColor #102A43
+    MessageFontColor #263238
+    MessageAlign center
+    BoxBorderColor #90A4AE
+    BoxFontColor #102A43
+    BoxPadding 12
+    Padding 8
+    ParticipantPadding 14
+    ParticipantFontSize 15
+    MessageFontSize 12
+    NoteFontSize 11
+    NoteBackgroundColor #FFF8E1
+    NoteBorderColor #D6A84F
+}
+
+ title QuickFIX/J 三方订单完全成交全流程
+
+ legend bottom
+ |= 角色/技术边界 | 含义 |
+ | <back:#E8F1F8>买方</back> | Banzai / Buy-Side OMS：创建订单、维护本地订单与成交 |
+ | <back:#EAF4EA>卖方</back> | Executor / Sell-Side：接单、生成 OrderID、路由、汇总交易所结果 |
+ | <back:#F4F0FA>交易所</back> | OrderMatch / Exchange：简化订单簿和撮合结果 |
+ | QuickFIX/J Session | 只负责 FIX 编解码、Header、序号、校验、Socket 收发和 Application 回调 |
+ endlegend
+
+box "买方：Banzai / Buy-Side OMS" #E8F1F8
+participant "Banzai UI\nBanzaiApplication" as BUY #DDEBF7
+participant "QuickFIX/J\nSocketInitiator + Session" as BUY_SESSION #E8F1F8
+end box
+
+box "卖方：Executor / Sell-Side Execution System" #EAF4EA
+participant "QuickFIX/J\nSocketAcceptor + Session" as SELL_SESSION #EAF4EA
+participant "Executor Application\n订单/路由状态" as SELL #DFF0DF
+end box
+
+box "交易所：OrderMatch / Exchange（简化）" #F4F0FA
+participant "FIX Session" as EX_SESSION #F4F0FA
+participant "Order Book /\nMatching Engine" as EX #EDE5F7
+end box
+
+== 订单创建与买方发单 ==
+
+BUY -> BUY: 创建本地 Order\nClOrdID=C001\nSymbol=600000\nSide=BUY\nOrderQty=100\nPrice=P
+note right of BUY
+  本地图中 Q=100，成交价为 P。
+  买方先在本地建立订单，
+  之后用 ClOrdID 关联回报。
+end note
+
+BUY -> BUY_SESSION: 构造 NewOrderSingle
+BUY_SESSION -> BUY_SESSION: Session.sendToTarget(...)\n补充 Header / MsgSeqNum(34)\n校验并写入 TCP
+BUY_SESSION -> SELL_SESSION: NewOrderSingle (35=D)\n\n11=ClOrdID=C001\n55=Symbol=600000\n54=Side=1 (BUY)\n38=OrderQty=100\n40=OrdType=2 (LIMIT)\n44=Price=P\n59=TimeInForce=0 (DAY)
+
+== 卖方接单与回执 ==
+
+SELL_SESSION -> SELL: 校验 / 解码\nApplication.onMessage(NewOrderSingle)
+SELL -> SELL: 接单与基础校验\n生成卖方 OrderID=S1001\n建立路由订单
+
+SELL -> SELL_SESSION: 生成 ExecutionReport
+SELL_SESSION -> BUY_SESSION: ExecutionReport (35=8)\n\n37=OrderID=S1001\n17=ExecID=E001\n11=ClOrdID=C001\n150=NEW\n39=NEW\n14=CumQty=0\n151=LeavesQty=100
+BUY_SESSION -> BUY: fromApp(...)\n按 ClOrdID=C001 查找订单\n按 ExecID=E001 去重\n更新状态：NEW
+
+== 卖方路由到交易所 ==
+
+SELL -> SELL_SESSION: 路由订单至交易所\n生成交易所方向 ClOrdID=R2001
+SELL_SESSION -> EX_SESSION: NewOrderSingle（简化）\n\n35=D\n11=ClOrdID=R2001\n55=Symbol=600000\n54=Side=1\n38=OrderQty=100\n40=OrdType=2\n44=Price=P
+EX_SESSION -> EX: onMessage(NewOrderSingle)\n接收并进入订单簿
+EX -> EX_SESSION: 交易所接收确认\nOrderID(37)=EX3001
+EX_SESSION -> SELL_SESSION: Order Accepted（简化回报）\nOrderID(37)=EX3001
+SELL_SESSION -> SELL: 建立订单映射\n卖方 OrderID=S1001\n交易所 OrderID=EX3001 (37)
+
+== 交易所撮合与成交结果 ==
+
+note over EX
+  全成交前提：
+  同一 Symbol 存在足量反向对手盘；
+  最优买卖价格满足撮合条件；
+  对手盘数量 >= 100。
+  OrderID(37)=EX3001 是交易所分配的订单标识，\n  不是名为 ExchangeOrderID 的 FIX 字段。\n  FIX 4.2 的成交数量字段使用 LastShares(32)。
+end note
+
+EX -> EX: Order Book / Matching Engine\n匹配反向对手盘\n成交数量=100，成交价=P
+EX -> EX_SESSION: Execution Result（简化）\n\n37=EX3001  (OrderID)\n17=EXE001  (ExecID)\n11=R2001    (ClOrdID)\n150=FILL\n39=FILLED\n32=100      (LastShares)\n31=P        (LastPx)\n14=100      (CumQty)\n151=0       (LeavesQty)\n6=P        (AvgPx)
+EX_SESSION -> SELL_SESSION: ExecutionReport（交易所方向）
+SELL_SESSION -> SELL: 更新路由订单\n交易所结果 -> 卖方成交状态
+
+== 卖方汇总后回报买方 ==
+
+SELL -> SELL: 汇总交易所成交结果\nS1001：CumQty=100\nLeavesQty=0\n状态=FILLED
+SELL -> SELL_SESSION: 生成买方方向 ExecutionReport
+SELL_SESSION -> BUY_SESSION: ExecutionReport (35=8)\n\n37=OrderID=S1001\n17=ExecID=E002\n11=ClOrdID=C001\n150=FILL\n39=FILLED\n32=LastShares=100\n31=LastPx=P\n14=CumQty=100\n151=LeavesQty=0\n6=AvgPx=P
+BUY_SESSION -> BUY: fromApp(...)\n按 ClOrdID=C001 关联\n按 ExecID=E002 去重\n更新订单表 / 成交表
+
+note right of BUY
+  买方最终状态：
+  OrderStatus = FILLED
+  OpenQty = 0
+  ExecutedQty = 100
+  AvgPx = P
+end note
+
+== 边界说明 ==
+
+note over SELL, EX
+  本图是合理化三方学习架构：
+  当前仓库 Executor example 会直接模拟 NEW/FILLED 回报，
+  OrderMatch example 是独立的直接撮合示例；
+  实际生产系统中由卖方通过另一条 FIX Session 路由到交易所。
+end note
+
+@enduml
