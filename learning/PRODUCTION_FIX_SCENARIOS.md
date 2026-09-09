@@ -1,6 +1,54 @@
 # 生产级 FIX 核心问题与回答
 
-本文整理五个生产环境中常见的 FIX 订单与会话问题。每个问题只保留两部分：架构图和精简回答。
+本文整理生产环境中常见的 FIX 订单与会话问题。每个问题只保留两部分：架构图和精简回答。
+
+---
+
+## 机构交易架构设计
+
+https://technologynova.org/%e4%bb%8etag-35d%e5%88%b0tag-358%ef%bc%9a%e6%b7%b1%e5%ba%a6%e8%a7%a3%e5%89%96fix%e5%8d%8f%e8%ae%ae%e5%9c%a8%e8%ae%a2%e5%8d%95%e7%ae%a1%e7%90%86%e7%b3%bb%e7%bb%9f%ef%bc%88oms%ef%bc%89%e4%b8%ad/
+
+## Top10 核心 MsgType
+
+下面是买方、卖方和交易所订单链路中最常用、最值得优先掌握的 10 个 `MsgType(35)`：
+
+| 排名 | MsgType | 消息 | 主要作用 |
+|---:|:---:|---|---|
+| 1 | `A` | Logon | 建立或恢复 FIX Session |
+| 2 | `0` | Heartbeat | 保持 Session 活跃 |
+| 3 | `1` | TestRequest | 请求对方立即返回 Heartbeat |
+| 4 | `2` | ResendRequest | 请求重传缺失序号范围 |
+| 5 | `4` | SequenceReset | 序号重置或 GapFill |
+| 6 | `5` | Logout | 正常关闭 Session |
+| 7 | `D` | NewOrderSingle | 发送新订单 |
+| 8 | `8` | ExecutionReport | 返回订单状态、成交、撤单等结果 |
+| 9 | `F` | OrderCancelRequest | 请求撤销订单 |
+| 10 | `G` | OrderCancelReplaceRequest | 请求改单 |
+
+核心订单链路：
+
+```text
+35=D  新单
+   │
+   ├─ 35=8  NEW / PARTIAL / FILLED
+   ├─ 35=G  改单请求
+   └─ 35=F  撤单请求
+          │
+          ├─ 35=8  撤单状态回报
+          └─ 35=9  撤单被拒
+```
+
+补充两个也很重要的消息：
+
+```text
+35=3  Reject
+    = Session 层消息被拒绝
+
+35=9  OrderCancelReject
+    = 撤单请求被拒绝
+```
+
+其中 `35=9` 在实际订单系统中也很常见；如果系统不支持改单，可以暂时优先学习 `35=9`，而不是 `35=G`。
 
 ---
 
@@ -15,8 +63,7 @@ FIX Session 重连
 比较双方 MsgSeqNum(34)
       │
       ├── 缺口较小
-      │      ├─ 订单/成交/撤单结果：原样重传
-      │      └─ 心跳/无需恢复消息：SequenceReset + GapFill
+      │      └─ 进入消息恢复流程
       │
       └── 缺口几十万
              │
@@ -24,40 +71,69 @@ FIX Session 重连
         进入恢复模式
              │
              ├─ 暂停新订单、改单、撤单
-             ├─ ResendRequest(35=2) 分段请求
-             ├─ 关键业务消息：重传或业务对账
-             ├─ 行情：GapFill 后重新获取 Snapshot
-             └─ 其余非业务区间：SequenceReset(35=4, 123=Y)
-                              │
-                              ▼
-                     MsgSeqNum 对齐
-                              │
-                              ▼
-                       恢复正常交易
+             ├─ ResendRequest(35=2)
+             │    7=BeginSeqNo
+             │   16=EndSeqNo
+             │
+             ▼
+      发送方扫描 MessageStore / Journal
+             │
+             ├─ 连续无需恢复区间
+             │    例如：100 ~ 99999 全部是 Heartbeat
+             │    └─ 发送 1 条 SequenceReset(35=4)
+             │       34=100
+             │       123=Y
+             │       36=100000
+             │       （跳过整个区间，不逐条发送 Heartbeat）
+             │
+             ├─ 业务消息
+             │    35=D / 35=8 / 35=F / 35=G
+             │    └─ 原样重传
+             │       34=原序号
+             │       43=Y
+             │       122=原始发送时间
+             │
+             └─ 可恢复行情增量
+                  └─ GapFill，之后重新获取最新 Snapshot
+             │
+             ▼
+       例如：连续区间夹杂业务消息
+             │
+             ├─ 35=4  跳过 100~99999
+             ├─ 35=D  重传 100000
+             ├─ 35=4  跳过 100001~199999
+             └─ 35=8  重传 200000
+             │
+             ▼
+          MsgSeqNum 对齐
+             │
+             ├─ 完成订单和成交业务对账
+             └─ 恢复正常交易
 ```
 
 ### 精简回答
 
-1. 不能无条件逐条重传几十万条消息。
-2. 订单确认、成交回报和撤单结果：原样重传，或完成业务对账确认后恢复。
-3. `Heartbeat`、`TestRequest` 和可恢复的行情增量：使用 `GapFill`，不逐条重传。
-4. 行情：跳过历史增量，重新获取最新快照。
-5. 使用 `ResendRequest(35=2)` 请求缺失区间：
+1. **按范围请求恢复**：缺口出现后暂停新订单、改单和撤单，使用 `ResendRequest(35=2)` 请求序号区间：
 
    ```text
    7=BeginSeqNo
    16=EndSeqNo
    ```
 
-6. 使用 `SequenceReset(35=4)` 跳过无需恢复的消息：
+2. **业务消息必须恢复**：`35=D`、`35=8`、`35=F`、`35=G` 等关键消息原样重传，保留原 `MsgSeqNum(34)`，并设置 `PossDupFlag(43)=Y`、`OrigSendingTime(122)`；也可以通过业务对账确认后恢复。
+
+3. **非业务消息使用 GapFill**：连续的 `Heartbeat`、`TestRequest` 和可恢复行情增量不逐条重传，而是用一条 `SequenceReset(35=4, 123=Y, 36=NewSeqNo)` 跳过整个连续区间。`35=4` 不是逐条替代 Heartbeat，而是一条区间跳转控制消息。
+
+4. **混合区间按业务消息分段**：扫描 `MessageStore / Journal`，遇到连续非业务区间先发送一条 GapFill，遇到业务消息再原样重传。例如：
 
    ```text
-   123=Y              // GapFillFlag
-    36=NewSeqNo
+   35=4  跳过 100~99999
+   35=D  重传 100000
+   35=4  跳过 100001~199999
+   35=8  重传 200000
    ```
 
-7. 恢复期间暂停业务发送；序号恢复不等于订单状态恢复，还要完成订单和成交对账。
-
+5. **恢复后完成校验**：序号对齐不代表业务状态已恢复，必须完成订单、成交和撤单结果对账后，才能恢复正常交易；历史 Heartbeat 可跳过，但实时 Heartbeat 仍需正常发送。
 ---
 
 ## 2. 一笔订单和对应撤单同时发出，先收到撤单 ExecutionReport，应该如何处理？
@@ -92,15 +168,11 @@ FIX Session 重连
 
 ### 精简回答
 
-1. 使用 `ClOrdID(11)=C002` 标识当前撤单请求。
-2. 使用 `OrigClOrdID(41)=C001` 指向被撤原订单。
-3. 使用 `OrderID(37)` 关联卖方订单。
-4. 收到 `ExecType=Pending Cancel(6)`：进入待撤状态，不立即标记为 `Canceled`。
-5. 收到 `ExecType=Canceled(4)`：撤单成功，订单进入终态。
-6. 收到 `OrderCancelReject(35=9)`：撤单失败，不能当作撤单成功。
-7. 如果交易所先成交，撤单通常返回 `OrderCancelReject`。
-8. 如果订单已经进入 `Canceled`，迟到的 `New` 回报不能把订单恢复为活动状态。
-9. 最终状态必须由订单状态机和交易所实际处理顺序决定，不能简单按回报到达顺序覆盖。
+1. 使用 `ClOrdID(11)=C002` 标识当前撤单请求，使用 `OrigClOrdID(41)=C001` 指向原订单，并通过 `OrderID(37)` 关联卖方订单。
+2. 收到 `ExecType=Pending Cancel(6)`：进入待撤状态；收到 `ExecType=Canceled(4)`：撤单成功并进入终态。
+3. 收到 `OrderCancelReject(35=9)`：撤单失败，不能当作撤单成功；如果交易所先成交，撤单通常会被拒绝。
+4. 订单进入 `Canceled` 或 `Filled` 等终态后，迟到的 `New` 回报不能覆盖终态。
+5. 最终状态必须由订单状态机和交易所实际处理顺序决定，不能简单按回报到达顺序覆盖。
 
 ---
 
@@ -138,10 +210,8 @@ ExecutionReport(35=8)
 
 ### 精简回答
 
-1. `SenderCompID(49)` 表示 FIX Session 层的公司或机构身份。
-2. `Account(1)` 表示本笔订单使用的资金或交易账号。
-3. 账户主数据通过 `Account(1)` 关联公司、基金、策略、风控和结算信息。
-4. 例如：
+1. `SenderCompID(49)` 表示 FIX Session 层的公司或机构身份，`Account(1)` 表示本笔订单使用的资金或交易账号。
+2. 账户主数据通过 `Account(1)` 关联公司、基金、策略、风控和结算信息，例如：
 
    ```text
    49=BUY001
@@ -149,9 +219,8 @@ ExecutionReport(35=8)
     1=FUND-A-TRADING
    ```
 
-5. 卖方通过 `BUY001 + FUND-A-TRADING` 查找具体公司和账户。
-6. 一个公司管理多个基金或子账户时，每笔订单都应明确填写 `Account(1)`。
-7. 需要表达基金、执行方、清算方等更细粒度参与者时，使用 `Parties` 重复组：
+3. 卖方通过 `BUY001 + FUND-A-TRADING` 查找具体公司和账户；一个公司管理多个基金或子账户时，每笔订单都应明确填写 `Account(1)`。
+4. 需要表达基金、执行方、清算方等更细粒度参与者时，使用 `Parties` 重复组：
 
    ```text
    453=NoPartyIDs
@@ -160,7 +229,7 @@ ExecutionReport(35=8)
    452=PartyRole
    ```
 
-8. FIX 不会自动判断账号属于哪个公司，双方必须通过 Session 身份、账号约定和账户主数据完成关联。
+5. FIX 不会自动判断账号属于哪个公司，双方必须通过 Session 身份、账号约定和账户主数据完成关联。
 
 ---
 
@@ -252,7 +321,23 @@ ExecutionReport(35=8)
    | `G` | OrderCancelReplaceRequest | `11`、`41`、`37`，以及新的 `38`、`40`、`44`、`59` |
    | `9` | OrderCancelReject | `11`、`41`、`37`、`39`、`434`、`102` |
 
-6. 核心关联：
+6. `ExecType(150)` 和 `OrdStatus(39)` 的区别：
+
+   | 字段 | 含义 | 示例 |
+   |---|---|---|
+   | `ExecType(150)` | 本次 `ExecutionReport` 表达的事件，即“这次发生了什么” | `New`、`Partial Fill`、`Fill`、`Pending Cancel`、`Canceled` |
+   | `OrdStatus(39)` | 处理本次事件后订单的当前状态，即“订单现在是什么状态” | `New`、`Partially Filled`、`Filled`、`Pending Cancel`、`Canceled` |
+
+   例如：
+
+   ```text
+   150=2  Fill
+   39=2   Filled
+   ```
+
+   表示本次事件是完全成交，处理后订单当前状态为已成交。两者有时取值相同，但职责不同；`ExecType` 是事件，`OrdStatus` 是状态。
+
+7. 核心关联：
 
    ```text
    Account(1)       = 资金账号
@@ -297,20 +382,10 @@ ExecutionReport(35=8)
 
 ### 精简回答
 
-1. 分开保存三类数据：
-   - `MessageStore`：保存 `MsgSeqNum` 和 FIX 历史报文，用于 Session 重传；
-   - `FIX Message Journal`：保存每条入站、出站原始 FIX 报文，用于审计和重放；
-   - 业务数据库：保存订单、成交、持仓、资金和状态变更。
-2. 入站消息处理：收到报文后写入 `Journal / Inbox`，同步复制到灾备，完成业务处理，更新订单与成交，最后标记 `PROCESSED`。
-3. 出站消息处理：生成订单意图，持久化原始报文和 `ClOrdID`，同步复制后发送网络，最后标记 `SENT`。
-4. 主备切换：
-   - fencing 旧主节点；
-   - 灾备节点获得唯一 Session 发送权；
-   - 恢复 `MessageStore` 和业务数据库；
-   - 处理 `RECEIVED`、`PROCESSING`、`UNKNOWN` 消息；
-   - 执行 FIX Logon、Resend 和业务对账；
-   - 恢复新订单发送。
-5. 使用以下唯一键和幂等机制避免重复：
+1. 分开保存三类数据：`MessageStore` 保存 FIX 历史报文用于 Session 重传；`FIX Message Journal` 保存每条入站、出站原始报文用于审计和重放；业务数据库保存订单、成交、持仓、资金和状态。
+2. 入站消息先写入 `Journal / Inbox` 并同步复制到灾备，再完成业务处理、更新订单与成交，最后标记 `PROCESSED`；出站消息先持久化订单意图、原始报文和 `ClOrdID`，同步复制后发送，最后标记 `SENT`。
+3. 主备切换时 fencing 旧主节点，由灾备获得唯一 Session 发送权，恢复 `MessageStore` 和业务数据库，处理 `RECEIVED`、`PROCESSING`、`UNKNOWN` 消息，并执行 FIX Logon、Resend 和业务对账。
+4. 使用唯一键和幂等机制避免重复：
 
    ```text
    (SessionID, MsgSeqNum)
@@ -318,9 +393,7 @@ ExecutionReport(35=8)
    (OrderID, EventID)
    ```
 
-6. 如果要求订单和成交消息 `RPO=0`，必须确认消息已同步持久化到灾备副本后，才将其视为可靠。
-7. 网络发送后主机立即宕机会出现 `UNKNOWN` 状态，此时必须查询交易所或对手方，不能直接生成新的 `ClOrdID` 重发。
-8. 最终原则：`MessageStore` 恢复 FIX 会话，`Journal` 恢复原始消息事实，业务数据库恢复订单状态，同步复制保证灾备数据最新，幂等与对账避免重复和遗漏。
+5. `RPO=0` 时，消息必须同步持久化到灾备副本后才视为可靠；网络发送后宕机形成 `UNKNOWN` 时，必须查询交易所或对手方，不能直接生成新的 `ClOrdID` 重发。
 
 ---
 
@@ -344,15 +417,48 @@ ExecutionReport(35=8)
         │      └─ 使用原 ClOrdID 补发
         │
         └─ 3. 无法确认
-               └─ 暂停重发，继续对账
+### 精简回答
+
+1. 买方收到卖方 `OrdStatus=NEW`，只说明卖方已接单，不代表交易所已接收；断线后卖方应将交易所方向订单标记为 `UNKNOWN`，保留原 `ClOrdID`。
+2. 交易所确认订单已存在：记录交易所 `OrderID(37)`，绑定原订单，禁止重复下单。
+3. 交易所明确确认不存在：使用原 `ClOrdID` 补发，不生成新的 `ClOrdID`。
+4. 无法确认时：保持 `UNKNOWN`，暂停重发，继续查询或进行业务对账。
+5. 核心原则：使用 `ClOrdID + 状态查询 + 幂等控制`，不能把本地发送成功当成交易所已接收。
+```
+
+---
+
+## 7. Acceptor、Initiator 和 HeartBtInt(108) 如何区分？
+
+### 架构图
+
+```text
+                    TCP 连接方向
+┌────────────────────────┐          ┌────────────────────────┐
+│ Initiator              │ ───────▶ │ Acceptor               │
+│ 主动连接对方地址         │          │ 监听端口、接受连接        │
+│ 发送第一条 Logon(35=A)  │          │ 接收并回复 Logon          │
+└──────────┬─────────────┘          └──────────┬─────────────┘
+           │                                   │
+           └────────── FIX Session ────────────┘
+                         │
+                         ▼
+              Logon 中协商 HeartBtInt(108)
+                         │
+                         ▼
+        双方按约定的间隔检查会话并发送 Heartbeat(35=0)
 ```
 
 ### 精简回答
 
-1. 买方收到卖方 `OrdStatus=NEW`，只说明卖方已接单，不代表交易所已接收。
-2. 断线后，卖方将交易所方向订单标记为 `UNKNOWN`，并保留原 `ClOrdID=R2001`。
-3. 重连后分类处理：
-   - 交易所已存在：记录 `OrderID(37)`，禁止重复下单；
-   - 明确未存在：使用原 `ClOrdID=R2001` 补发，不生成新的 `ClOrdID`；
-   - 无法确认：保持 `UNKNOWN`，暂停重发并继续对账。
-4. 核心原则：`ClOrdID + 状态查询 + 幂等控制`，不能把本地发送成功当成交易所已接收。
+1. `Initiator` 主动连接对方地址，并发送第一条 `Logon(35=A)`；`Acceptor` 监听本地端口，接受连接并处理对方的 Logon。
+2. 两者只表示 TCP 连接方向，不代表买方或卖方角色：买方和卖方都可以是 Initiator 或 Acceptor。
+3. `HeartBtInt(108)` 是 FIX Session 的会话参数，不是业务字段；双方应在 Session 协议和配置中预先约定。
+4. Initiator 通常在第一条 `Logon` 中提出 `HeartBtInt(108)`；Acceptor 根据双方配置和协议校验、接受或拒绝不匹配的值。
+5. 最终记忆：
+
+   ```text
+   Initiator  = 主动建立 TCP 连接
+   Acceptor   = 监听并接受 TCP 连接
+   HeartBtInt = 双方约定，Initiator 在 Logon 中提出，Acceptor 校验确认
+   ```
