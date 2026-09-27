@@ -158,7 +158,7 @@ public class Executor {
     private static InputStream getSettingsInputStream(String[] args) throws FileNotFoundException {
         InputStream inputStream = null;
         if (args.length == 0) {
-            inputStream = Executor.class.getResourceAsStream("executor.cfg");
+            inputStream = Executor.class.getResourceAsStream("executor_dynamic.cfg");
         } else if (args.length == 1) {
             inputStream = new FileInputStream(args[0]);
         }

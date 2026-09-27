@@ -1,8 +1,8 @@
 # QuickFIX/J 学习路线与进度
 
 > 学习分支：`learning/ordermatch`  
-> 最后更新：2026-08-19  
-> 当前阶段：阶段三（理解 Session 引擎，正在进行）
+> 最后更新：2026-09-01  
+> 当前阶段：阶段三后半段（Session、多 Session 与生产级交易基础，正在进行）
 
 本文件是本地学习的恢复入口。每次继续前，先读 **当前进度** 与 **下一步**。
 
@@ -77,7 +77,37 @@ quickfix/examples/banzai/Banzai.java
 
 ---
 
-## 下一步：沿着第一笔订单阅读源码
+## 下一步：从 Session 引擎理解进入生产级买方交易系统设计
+
+当前已不再只是学习“如何收发一条 FIX 消息”，而是开始把 QuickFIX/J 放入买方 OMS / EMS 的生产架构中理解。
+
+```text
+Session 状态机
+  -> 动态 Session / 多 Session
+  -> ExecutionReport 与订单状态机
+  -> 自定义字段与 Rules of Engagement
+  -> 多券商路由、风控、持仓和审计
+  -> 并发、背压、监控与故障恢复
+```
+
+优先级最高的下一步：
+
+1. 完成 Banzai + Executor 多 FIX 版本 Session 联调。
+2. 深入 `Session.next()`、`nextLogon(...)`、`nextResendRequest(...)` 和 `sendRaw(...)` 的源码与断点实验。
+3. 将 `ExecutionReport` 扩展为 `New / PartiallyFilled / Filled / Rejected / Canceled` 状态机。
+4. 修正 Executor 示例中的 `CumQty / LeavesQty` 字段语义，并验证 Banzai 本地订单状态不会重复扣减。
+5. 将 `InvestmentDecisionID(9001)` 从硬编码字段演进为领域 `Order` 属性和共享类型安全字段类。
+6. 设计 `SessionRegistry`、行情 Session / 交易 Session 分类与基础 `OrderRouter`。
+
+```text
+当前阶段目标：
+从“理解 QuickFIX/J 的 Session 与消息机制”
+进入“能够设计一个小型、可恢复、可扩展的买方 FIX 接入层”。
+```
+
+---
+
+## 原阶段三学习计划（保留作为源码实验清单）
 
 目标：理解 Banzai 的 `NewOrderSingle` 如何从网络报文进入 OrderMatch 的强类型处理方法，再如何返回 `ExecutionReport`。
 
@@ -563,11 +593,11 @@ ResendRequest
 断线重连与 Store
 ```
 
-### 阶段三：理解 Session 引擎（当前进行中）
+### 阶段三：理解 Session 引擎（当前实战重点）
 
-- [ ] 阅读 `quickfixj-core/src/main/java/quickfix/Session.java` 的 `next()`，理解定时驱动入口。
+- [ ] 阅读 `quickfixj-core/src/main/java/quickfix/Session.java` 的 `next()`，用断点确认定时驱动入口。
 - [ ] 追踪 `generateLogon()`、`initializeHeader(...)`、`sendRaw(...)` 的出站 Logon 流程。
-- [ ] 追踪 `nextLogon(...)`、`nextLogout(...)` 的入站会话状态转换。
+- [ ] 追踪 `nextLogon(...)`、`nextLogout(...)`、`nextResendRequest(...)` 的入站会话状态转换。
 - [x] 结合真实日志观察 `MsgSeqNum(34)`、Heartbeat、TestRequest、Logout 和断线重连。
 - [ ] 使用 Banzai + Executor 做多 FIX 版本 Session 联调，确认 `fix40` 到 `fix50` 的强类型分派。
 
